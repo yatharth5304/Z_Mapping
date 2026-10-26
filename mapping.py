@@ -1,11 +1,19 @@
 """Local Zuventus mapping with master-derived brands, variants, and diagnostics."""
 import re
 import sys
+from io import BytesIO
+from dataclasses import replace
+from functools import lru_cache
+from itertools import islice
 from pathlib import Path
 import pandas as pd
 from openpyxl import Workbook, load_workbook
 from rapidfuzz import fuzz, process
 from rapidfuzz.distance import Levenshtein, JaroWinkler
+from excel_autosave import AsyncWorkbookSaver, save_workbook_atomic
+from pro_diof import parse_description as parse_pro_diof_description, select_presentation as select_pro_diof_presentation
+from pack_selection import matched_measurement, measurement, parse_master_pack, select_pack_rows
+from source_brand_aliases import resolve_source_brand_alias, replace_source_brand_alias
 MASTER_XLSX_PATH = Path(__file__).resolve().with_name('zuventus_product.xlsx')
 INPUT_OUTPUT_XLSX_PATH = Path(__file__).resolve().with_name('mapping.xlsx')
 ROW_LIMIT = None
@@ -37,6 +45,21 @@ FORM_HINT_TOKENS = {'BARS', 'SYR', 'TABLETS', 'INJ', 'CAP', 'GRANULES', 'CAPSULE
 VARIANT_TOKEN_EQUIVALENTS = {'TA': 'TABLET', 'TAB': 'TABLET', 'TABS': 'TABLET', 'TABLETS': 'TABLET', 'CAP': 'CAPSULE', 'CAPS': 'CAPSULE', 'CAPSULES': 'CAPSULE', 'INJ': 'INJECTION', 'INJECTIONS': 'INJECTION', 'DROP': 'DROPS', 'SYP': 'SYRUP', 'BARS': 'BAR', 'GRANUL': 'GRANULES', 'LOT': 'LOTION', 'LO': 'LOTION', 'CRM': 'CREAM', 'CR': 'CREAM'}
 INPUT_TOKEN_EQUIVALENTS = {'ING': 'INJECTION', 'INJ': 'INJECTION', 'INJN': 'INJECTION', 'INJN.': 'INJECTION', 'INJ.': 'INJECTION', 'SYR': 'SYRUP', 'SYP': 'SYRUP', 'SUSP': 'SUSPENSION', 'SUSPN': 'SUSPENSION', 'AMP': 'INJECTION', 'AMPS': 'INJECTION', 'AMPUL': 'INJECTION', 'AMPULE': 'INJECTION', 'AMPULES': 'INJECTION', 'AMPOULE': 'INJECTION', 'AMPOULES': 'INJECTION', 'VIAL': 'VIAL', 'VL': 'VIAL', 'PFS': 'PFS', 'PEN': 'PEN', 'TAB': 'TABLET', 'TABS': 'TABLET', 'TA': 'TABLET', 'TABLETS': 'TABLET', 'CAP': 'CAPSULE', 'CAPS': 'CAPSULE', 'CAPSULE': 'CAPSULE', 'CAPSULES': 'CAPSULE', 'DROP': 'DROPS', 'DROPS': 'DROPS', 'INJECTION': 'INJECTION', 'SYRUP': 'SYRUP', 'SUSPENSION': 'SUSPENSION', 'TABLETSNU': 'TABLETS', 'AMPOULEP': 'INJECTION', 'TABLETP': 'TABLET', 'AMPOUL': 'INJECTION', 'AMPOULS': 'INJECTION', 'INJG': 'INJECTION', 'INJE': 'INJECTION', 'NEDDLES': 'NEEDLES', 'NEEDALES': 'NEEDLES', 'PAKET': 'PACK', 'PACKET': 'PACK', 'VAIL': 'VIAL', 'VALE': 'VIAL', 'INJD': 'INJECTION', 'INGD': 'INJECTION', 'SY': 'SYRUP', 'TABD': 'TABLET', 'CAPD': 'CAPSULE', 'CAPSUL': 'CAPSULE', 'CAPSULS': 'CAPSULE', 'CREA': 'CREAM', 'OINT': 'OINTMENT', 'OINTB': 'OINTMENT', 'POW': 'POWDER', 'GRANUL': 'GRANULES', 'GRANU': 'GRANULES', 'GRANULS': 'GRANULES', 'LOT': 'LOTION', 'LOTION': 'LOTION', 'CRM': 'CREAM', 'CR': 'CREAM', 'CRM.': 'CREAM', 'CR.': 'CREAM', 'OINTM': 'OINTMENT', 'OINTMENT': 'OINTMENT', 'BAR': 'BAR', 'BARS': 'BAR', 'TABLETNU': 'TABLET', 'TABSP': 'TABLET', 'CAPSULP': 'CAPSULE', 'AMPOULP': 'INJECTION', 'DROPSP': 'DROPS', 'IN': 'INJECTION', 'GRANULIS': 'GRANULES', 'CHEB': 'CHEWABLE', 'F/WASH': 'FACE WASH', 'FACEWASH': 'FACE WASH', 'SYNDEN': 'SYNDET', 'MOISTURIS': 'MOISTURIZING', 'HYD': 'HYDRATING', 'CLEN': 'CLEAN', 'FLV': 'FLAVOR', 'FLAV': 'FLAVOR', 'FLAVOUR': 'FLAVOR'}
 GENERIC_VARIANT_MATCH_TOKENS = {'TABLET', 'CAPSULE', 'INJECTION', 'SYRUP', 'DROPS', 'CREAM', 'LOTION', 'GEL', 'OINTMENT', 'SOLUTION', 'SUSPENSION', 'POWDER', 'SACHET', 'BAR', 'GRANULES'}
+
+_NASAL_SPRAY_ABBREVIATION = re.compile(r'(?<![A-Z0-9])N\s*/\s*SPRAY(?![A-Z0-9])', re.IGNORECASE)
+_VARIANT_ABBREVIATIONS = dict.fromkeys(('FORT', 'FORTS', 'FORET', 'FORTR', 'FOTRE', 'FROTE', 'FORATE', 'FO', 'FRT', 'FT'), 'FORTE')
+_FORTE_ALIASES = '|'.join(sorted((*_VARIANT_ABBREVIATIONS, 'FORTE'), key=len, reverse=True))
+_FORTE_END = r'(?=$|[^A-Z0-9]|(?:DRY)?(?:SYRUP|SYP|SYR|TABLET|TAB|TA|INJECTION|INJ)(?=$|[^A-Z0-9]|\d)|\d)'
+_FORTE_DESCRIPTOR = re.compile(r'(?<![A-Z0-9])(?:' + _FORTE_ALIASES + ')' + _FORTE_END, re.I)
+_FORTE_HINT = re.compile(r'F(?:O|RO|RT|T)', re.I)
+_CTAX_FORTE_FORMS = re.compile(r'(?<![A-Z0-9])(?:D\s*/\s*(?:SYP|SYR(?:UP)?|S)?|DS|SUP|S)(?![A-Z0-9])', re.I)
+_CTAX_FORTE_SPLIT_SYRUP = re.compile(r'(?<![A-Z0-9])SY\s+P(?![A-Z0-9])', re.I)
+_CTAX_FORTE_34_6_METADATA = re.compile(r'(?<![A-Z0-9])\(\s*34\s*\+\s*6\s*\)(?![A-Z0-9])')
+_CTAX_FIFTY = re.compile(r'(?<![A-Z0-9.])50(?:MLBOT|\s*M(?:\.L)?)(?![A-Z0-9.])', re.I)
+_CTAX_FIFTY_BARE = re.compile(r'(?<![A-Z0-9.])50(?![A-Z0-9.])(?!\s*(?:ML|MG|GM|MCG|G|L|KG|IU|UNIT)\b)', re.I)
+_DUPLICATE_50M = re.compile(r'(?<![A-Z0-9.])50M(?![A-Z0-9.])', re.IGNORECASE)
+_EXPLICIT_50ML = re.compile(r'(?<![A-Z0-9.])50\s*ML(?![A-Z0-9])', re.IGNORECASE)
+_PACK_MEASUREMENT = re.compile(r'(?<![A-Z0-9.])(\d+(?:\.\d+)?|\.\d+)\s*(MCG|MG|GM|ML|KG|G|L|IU|UNIT)\b', re.I)
 
 def norm(s: str) -> str:
     s = str(s or '').upper().strip()
@@ -110,6 +133,7 @@ def extract_variant_match_tokens(text: str) -> set:
             tokens.add(token)
     return tokens
 
+@lru_cache(maxsize=1024)
 def build_flexible_brand_pattern(brand_name: str) -> str:
     brand_compact = compact_brand_token(brand_name)
     if not brand_compact:
@@ -156,6 +180,149 @@ def strip_brand_from_input(input_text: str, brand_name: str, available_variants:
         if stripped != input_upper:
             return re.sub('\\s+', ' ', stripped).strip()
     return re.sub('\\s+', ' ', input_upper).strip()
+
+
+@lru_cache(maxsize=2048)
+def _variant_vocabulary(attributes: tuple) -> frozenset:
+    return frozenset(token for attribute in attributes
+                     for token in re.findall('[A-Z0-9]+', str(attribute).upper()))
+
+
+def _normalize_variant_abbreviations(text: str, variants, sub_variants=()) -> str:
+    """Expand descriptor tokens only when supported by this catalog vocabulary."""
+    if not _FORTE_HINT.search(text):
+        return text
+    vocabulary = _variant_vocabulary(tuple(sorted(set(variants) | set(sub_variants))))
+    if 'FORTE' not in vocabulary:
+        return text
+    for pattern, prefix in _forte_compound_prefixes(tuple(sorted(variants))):
+        text = pattern.sub(lambda match: prefix + ' ', text)
+
+    def expand(match):
+        token = match.group().upper()
+        expanded = _VARIANT_ABBREVIATIONS.get(token, token) if token not in vocabulary else token
+        separator = ' ' if match.end() < len(match.string) and match.string[match.end()].isalnum() else ''
+        return expanded + separator
+
+    return _FORTE_DESCRIPTOR.sub(expand, text)
+
+
+@lru_cache(maxsize=512)
+def _forte_compound_prefixes(variants: tuple) -> tuple:
+    patterns = []
+    for variant in variants:
+        words = normalize_variant_token(variant).split()
+        if 'FORTE' in words and words.index('FORTE'):
+            prefix = ''.join(words[:words.index('FORTE')])
+            flexible_prefix = r'[\s\-]*'.join(map(re.escape, prefix))
+            patterns.append((re.compile(r'(?<![A-Z0-9])' + flexible_prefix + r'(?=[\s\-/]*(?:' + _FORTE_ALIASES + ')' + _FORTE_END + ')', re.I), prefix))
+    return tuple(patterns)
+
+
+@lru_cache(maxsize=128)
+def _ctax_forte_identity_pattern(brand: str):
+    prefix = build_flexible_brand_pattern(brand).removesuffix('(?![A-Z0-9])')
+    return re.compile(prefix + r'[\s\-]*(?:[O0][\s\-]*){0,2}(?=(?:' + _FORTE_ALIASES + ')' + _FORTE_END + ')', re.I)
+
+
+@lru_cache(maxsize=256)
+def _forte_glued_brand_patterns(brand: str, variants: tuple) -> tuple:
+    brand_prefix = build_flexible_brand_pattern(brand).removesuffix('(?![A-Z0-9])')
+    patterns = []
+    for variant in variants:
+        words = normalize_variant_token(variant).split()
+        if 'FORTE' in words and words.index('FORTE'):
+            prefix = r'[\s\-]*'.join(map(re.escape, ''.join(words[:words.index('FORTE')])))
+            patterns.append(re.compile(brand_prefix + r'(?=[\s\-]*' + prefix + r'[\s\-]*(?:' + _FORTE_ALIASES + ')' + _FORTE_END + ')', re.I))
+    return tuple(patterns)
+
+
+_FORTE_BRAND_CACHE = (None, ())
+
+
+def _recover_forte_glued_brand(input_name, brand_map):
+    global _FORTE_BRAND_CACHE
+    cached_map, patterns_for_map = _FORTE_BRAND_CACHE
+    if cached_map is not brand_map:
+        patterns_for_map = []
+        for brand, items in brand_map.items():
+            variants = {item['variant'] for item in items if 'FORTE' in _variant_vocabulary((item['variant'],))}
+            patterns = list(_forte_glued_brand_patterns(brand, tuple(sorted(variants))))
+            if compact_brand_token(brand) == 'CTAX' and variants == {'O FORTE DRY'}:
+                patterns.append(_ctax_forte_identity_pattern(brand))
+            if patterns:
+                patterns_for_map.append((brand, patterns))
+        _FORTE_BRAND_CACHE = (brand_map, tuple(patterns_for_map))
+    matches = [brand for brand, patterns in patterns_for_map if any(pattern.search(input_name) for pattern in patterns)]
+    return matches[0] if len(matches) == 1 else None
+
+
+@lru_cache(maxsize=2048)
+def _variant_identity_tokens(variant: str) -> frozenset:
+    return frozenset(extract_variant_match_tokens(variant) - GENERIC_VARIANT_MATCH_TOKENS - {'PLAIN'})
+
+
+@lru_cache(maxsize=2048)
+def _required_forte_tokens(variant: str, brand_name: str) -> frozenset:
+    required = set(_variant_identity_tokens(variant))
+    # Only this confirmed compound presentation permits omission of DRY.
+    if compact_brand_token(brand_name) == 'CTAX' and normalize_variant_token(variant) == 'O FORTE DRY':
+        required.discard('DRY')
+    return frozenset(required)
+
+
+def _prepare_forte_candidates(input_name: str, brand: str, items: list) -> tuple:
+    """Keep explicit FORTE identity through all later filters and retries."""
+    variants, sub_variants, _ = extract_available_attributes_from_items(items)
+    forte_variants = {variant for variant in variants if 'FORTE' in _variant_vocabulary((variant,))}
+    for pattern in _forte_glued_brand_patterns(brand, tuple(sorted(forte_variants))):
+        input_name = pattern.sub(lambda match: str(brand) + ' ', input_name, count=1)
+    if compact_brand_token(brand) == 'CTAX' and forte_variants == {'O FORTE DRY'}:
+        # Confirmed C-TAX-only identity recovery: omitted O, OCR 0, or glued O.
+        identity = _ctax_forte_identity_pattern(brand)
+        input_name = identity.sub(lambda match: str(brand) + ' O ', input_name, count=1)
+    brand_match = re.search(build_flexible_brand_pattern(brand), input_name.upper())
+    offset = brand_match.end() if brand_match else 0
+    input_name = input_name[:offset] + _normalize_variant_abbreviations(input_name[offset:], variants, sub_variants)
+    descriptor = strip_brand_from_input(input_name, brand, available_variants=variants)
+    descriptor = _normalize_variant_abbreviations(descriptor, variants, sub_variants)
+    if not re.search(r'(?<![A-Z0-9])FORTE(?![A-Z0-9])', descriptor):
+        return input_name, items, False, ''
+    tokens = extract_variant_match_tokens(descriptor)
+    forms = detect_dosage_form_in_input(input_name, verbose=False)
+    groups = {_FORM_GROUPS[form] for form in forms if form in _FORM_GROUPS}
+    if len(groups) > 1:
+        return input_name, [], True, 'AMBIGUOUS_FORTE_FORM'
+    candidates = []
+    for item in items:
+        variant = str(item.get('variant', 'PLAIN')).upper()
+        sub_variant = str(item.get('sub_variant', 'PLAIN')).upper()
+        vocabulary = _variant_vocabulary((variant, sub_variant))
+        if 'FORTE' not in vocabulary:
+            continue
+        required = _required_forte_tokens(variant, brand)
+        required |= _required_forte_tokens(sub_variant, '')
+        if required.issubset(tokens):
+            candidates.append(item)
+    candidates = _form_compatible(candidates, forms)
+    if not candidates:
+        return input_name, [], True, 'VARIANT_NOT_IN_MASTER'
+    if compact_brand_token(brand) == 'CTAX' and {'O', 'FORTE'} <= tokens:
+        if forte_variants == {'O FORTE DRY'}:
+            # Confirmed source meanings, restricted to this unique FORTE identity.
+            input_name = _CTAX_FORTE_SPLIT_SYRUP.sub('SYRUP', input_name)
+            input_name = _CTAX_FORTE_34_6_METADATA.sub(' ', input_name)
+        input_name = re.sub(r'(?<![A-Z0-9])DRY(?=SYP(?:\b|\d))', 'DRY ', input_name)
+        input_name = re.sub(r'(?<![A-Z0-9])(?:SYP|SYRUP|SYR)(?=\d)', lambda match: match.group() + ' ', input_name)
+        input_name = _CTAX_FORTE_FORMS.sub(' DRY SYRUP ', input_name)
+        input_name = re.sub(r'(?<![A-Z0-9])PHI(?![A-Z0-9])', ' ', input_name)
+        input_name = _CTAX_FIFTY.sub('50 ML', input_name)
+        input_name = _CTAX_FIFTY_BARE.sub('50 ML', input_name)
+        input_name = re.sub(r'(?<=ML)32036005(?![A-Z0-9])', ' ', input_name)
+        # The approved duplicate is 50M beside an actual 50 ML quantity only.
+        if _EXPLICIT_50ML.search(input_name):
+            input_name = _DUPLICATE_50M.sub(' ', input_name)
+    return input_name, candidates, True, ''
 
 def normalize_master_text(value, default: str='') -> str:
     if pd.isna(value):
@@ -590,23 +757,33 @@ def extract_available_attributes_from_items(items: list) -> tuple:
     return (available_variants, available_sub_variants, available_pack_sizes)
 
 def extract_pack_size_from_input(s: str) -> str:
+    return _extract_pack_size(s)
+
+
+def _extract_pack_size(s: str, with_measurement=False):
     s_upper = normalize_ocr_numeric_noise(s)
+
+    def result(value, match):
+        if with_measurement and match.start() and s_upper[match.start() - 1] == '.':
+            value = '.' + str(value)
+        return matched_measurement(value, match, s_upper) if with_measurement else value
+
     triple_nxmxp = re.search('(?<![\\.\\d])(\\d+(?:\\.\\d+)?)\\s*[X*×]\\s*(\\d+)\\s*[X*×]\\s*(15)\\b', s_upper)
     if triple_nxmxp:
-        return '15'
+        return result('15', triple_nxmxp)
     nxm_matches = list(re.finditer('\\b(\\d+)\\s*[X*×]\\s*(\\d+(?:\\.\\d+)?)\\s*([STCP])?\\b', s_upper))
     for m in nxm_matches:
         n1 = float(m.group(1))
         n2 = float(m.group(2))
         total = n1 * n2
         if n1 <= 10 and n2 <= 100 and (total <= 500):
-            return str(int(total) if total.is_integer() else total)
+            return result(str(int(total) if total.is_integer() else total), m)
     full_nx1xm = re.search('\\b(\\d+)\\s*[X*×]\\s*1\\s*[X*×]\\s*(\\d+(?:\\.\\d+)?)\\s*([STCP])?\\b', s_upper)
     if full_nx1xm:
         n1 = float(full_nx1xm.group(1))
         n2 = float(full_nx1xm.group(2))
         total = 1 * n2
-        return str(int(total) if total.is_integer() else total)
+        return result(str(int(total) if total.is_integer() else total), full_nx1xm)
     if len(nxm_matches) > 1:
         pass
     m = re.search('\\b(\\d+)\\s*[X*×]\\s*(\\d+(?:\\.\\d+)?)(?:\\s*(?:ML|GM|MG|MCG|IU|G|L|KG|TA|TABS?|TABLETS?|CAPS?|CAPSULES?|T|C))?\\b', s_upper)
@@ -615,30 +792,30 @@ def extract_pack_size_from_input(s: str) -> str:
         n2 = float(m.group(2))
         total = n1 * n2
         if n1 <= 10 and n2 <= 100 and (total <= 500):
-            return str(int(total) if total.is_integer() else total)
+            return result(str(int(total) if total.is_integer() else total), m)
     m = re.search('\\bPACK\\s*(?:OF\\s*)?(\\d+)\\b', s_upper)
     if m:
-        return m.group(1)
+        return result(m.group(1), m)
     m = re.search('(?<!\\d)(\\d+)(?=[STCP])', s_upper)
     if m:
-        return m.group(1)
+        return result(m.group(1), m)
     m = re.search('\\b(\\d+)\\s+(?:S|T|PCS)\\b', s_upper)
     if m:
-        return m.group(1)
+        return result(m.group(1), m)
     adjacent_form_matches = []
     for m in re.finditer('(?<![\\d.])(\\d+)\\s*(?:TA|TABS?|TABLETS?|STRIPS?|CAPS?|CAPSULES?)\\b', s_upper):
         if is_reasonable_pack_count(m.group(1)):
-            adjacent_form_matches.append((m.start(), m.group(1)))
+            adjacent_form_matches.append((m.start(), m.group(1), m))
     for m in re.finditer('\\b(?:TA|TABS?|TABLETS?|STRIPS?|CAPS?|CAPSULES?)\\s*(\\d+)\\b', s_upper):
         if is_reasonable_pack_count(m.group(1)):
-            adjacent_form_matches.append((m.start(), m.group(1)))
+            adjacent_form_matches.append((m.start(), m.group(1), m))
     if adjacent_form_matches:
         adjacent_form_matches.sort(key=lambda x: x[0], reverse=True)
-        return adjacent_form_matches[0][1]
+        return result(adjacent_form_matches[0][1], adjacent_form_matches[0][2])
     m = re.search('\\b(\\d+(?:\\.\\d+)?)\\s*(?:ML|GM|G|L|KG)\\b', s_upper)
     if m:
-        return m.group(1)
-    return ''
+        return result(m.group(1), m)
+    return None if with_measurement else ''
 
 def load_master(path: str) -> pd.DataFrame:
     df = pd.read_excel(path, engine='openpyxl', dtype=object)
@@ -936,8 +1113,28 @@ def find_unmatched_qualifier_tokens(input_name: str, brand: str, available_varia
                 return i
             start = i + 1
     idx = _find_boundary(text, brand_up)
+    brand_match = None
+    if idx < 0 and brand:
+        possible = re.search(build_flexible_brand_pattern(brand), text)
+        if possible:
+            remainder = text[possible.end():]
+            strength = re.match(r'\s*(\d+(?:\.\d+)?)(?![\d.])', remainder)
+            known_strengths = {str(it.get('sub_variant', '')) for it in brand_items or []
+                               if is_numeric_subvariant_like(it.get('sub_variant', ''))}
+            printed_doses = re.findall(r'(?<![\d.])(\d+(?:\.\d+)?)\s*(MG|MCG|GM|IU|UNIT)\b', remainder)
+            compound_dose = re.match(r'\s*\d+(?:\.\d+)?\s*(?:MG|MCG|GM|IU|UNIT)?\s*(?:PLUS|/)\s*\d', remainder)
+            if (strength and strength.group(1) in known_strengths and not compound_dose
+                    and len({unit for _, unit in printed_doses}) <= 1
+                    and all(dose == strength.group(1) for dose, _ in printed_doses)):
+                catalog_units = {unit for it in brand_items or []
+                                 if str(it.get('sub_variant', '')) == strength.group(1)
+                                 for unit in re.findall(r'\d\s*(MG|MCG|GM|IU|UNIT)\b', str(it.get('product', '')).upper())}
+                if not catalog_units or all(unit in catalog_units for _, unit in printed_doses):
+                    brand_match = possible
     if idx >= 0:
         tail = text[idx + len(brand_up):]
+    elif brand_match:
+        tail = text[brand_match.end():]
     else:
         first = brand_up.split()[0] if brand_up.split() else ''
         pos = _find_boundary(text, first)
@@ -948,6 +1145,7 @@ def find_unmatched_qualifier_tokens(input_name: str, brand: str, available_varia
             bq_first = bq.split()[0] if bq.split() else bq
             bpos = _find_boundary(text, bq_first)
             tail = text[bpos + len(bq_first):] if bpos >= 0 else ''
+    tail = _normalize_variant_abbreviations(tail, available_variants or (), available_sub_variants or ())
     known = set(FORM_HINT_TOKENS) | set(DOSAGE_UNIT_SUFFIXES) | _pack_form_skip_tokens()
     known |= {'PLAIN'}
     known |= {str(v).upper() for v in available_variants or set()}
@@ -1020,6 +1218,15 @@ def filter_items_by_product_name_abbrev(input_name: str, brand_name: str, items:
     if not matched_upper:
         return items
     bm = re.search('\\b' + re.escape(matched_upper) + '\\b', input_upper)
+    if not bm and _FORTE_HINT.search(input_upper):
+        variants, sub_variants, _ = extract_available_attributes_from_items(items)
+        vocabulary = _variant_vocabulary(tuple(sorted(variants | sub_variants)))
+        if 'FORTE' in vocabulary:
+            descriptor = strip_brand_from_input(input_upper, brand_name, variants)
+            descriptor = _normalize_variant_abbreviations(descriptor, variants, sub_variants)
+            if 'FORTE' in extract_variant_match_tokens(descriptor):
+                pattern = build_flexible_brand_pattern(brand_name)
+                bm = re.search(pattern, input_upper) if pattern else None
     if not bm:
         return items
     tail_tokens = re.findall('[A-Z]{2,}', input_upper[bm.end():])
@@ -1174,7 +1381,7 @@ def find_best_brand_for_input(input_name: str, brand_map: dict, verbose=False) -
             return (best_brand, grouped_items)
     return (None, None)
 
-def detect_variants_in_input(input_name: str, brand_name: str, available_variants: set, compound_token_letters: set=None, verbose=False, brand_items: list=None) -> set:
+def detect_variants_in_input(input_name: str, brand_name: str, available_variants: set, compound_token_letters: set=None, verbose=False, brand_items: list=None, _exclude_inferred_forte=False) -> set:
     input_upper = normalize_ocr_numeric_noise(input_name)
     pack_positions = get_all_pack_positions(input_upper)
 
@@ -1190,6 +1397,7 @@ def detect_variants_in_input(input_name: str, brand_name: str, available_variant
         input_without_brand = strip_brand_from_input(input_upper, brand_name, available_variants=available_variants)
     else:
         input_without_brand = input_upper
+    input_without_brand = _normalize_variant_abbreviations(input_without_brand, available_variants)
     input_without_brand = re.sub('\\s+', ' ', input_without_brand).strip()
     normalized_input = normalize_variant_token(input_without_brand)
     compact_input_token_list = [compact_variant_token(token) for token in re.findall('[A-Z0-9.\\-]+', input_without_brand) if compact_variant_token(token)]
@@ -1346,6 +1554,13 @@ def detect_variants_in_input(input_name: str, brand_name: str, available_variant
                 if not is_in_pack_pattern(m.start(), m.end()):
                     detected_variants.add(var_name)
                     break
+    if 'FORTE' in input_match_tokens:
+        input_tokens = input_match_tokens
+        detected_variants = {variant for variant in detected_variants
+                             if 'FORTE' not in _variant_vocabulary((variant,))
+                             or _required_forte_tokens(variant, brand_name).issubset(input_tokens)}
+    if _exclude_inferred_forte:
+        detected_variants = {variant for variant in detected_variants if 'FORTE' not in variant.split()}
     if not any((variant != 'PLAIN' for variant in detected_variants)):
         detected_variants.add('PLAIN')
     if verbose:
@@ -1458,10 +1673,9 @@ def detect_sub_variants_in_input(input_name: str, brand_name: str, available_sub
         sub_signature = alpha_signature(sub_var)
         if len(sub_signature) >= 3 and sub_signature in input_alpha_signatures:
             detected_sub_variants.add(sub_var)
-    _SV_ABBREV = {'FORT': 'FORTE', 'FORTS': 'FORTE'}
-    for abbrev, expanded in _SV_ABBREV.items():
-        if abbrev in input_tokens_set_upper and expanded in available_sub_variants:
-            detected_sub_variants.add(expanded)
+    normalized_descriptor = _normalize_variant_abbreviations(input_without_brand, available_variants, available_sub_variants)
+    if 'FORTE' in extract_variant_match_tokens(normalized_descriptor) and 'FORTE' in available_sub_variants:
+        detected_sub_variants.add('FORTE')
     if not any((is_numeric_subvariant_like(s) for s in detected_sub_variants if s != 'PLAIN')):
         rescue_text = normalize_ocr_numeric_noise(input_without_brand)
         input_numbers = set()
@@ -1599,7 +1813,7 @@ def filter_by_subvariant_in_product_name(items: list, detected_sub_variants: set
         return [item for item, score, _ in matches_with_scores if score == best_score]
     return items
 
-def calculate_product_name_priority_score(product_name: str, input_name: str, detected_variants: set=None, detected_sub_variants: set=None) -> int:
+def calculate_product_name_priority_score(product_name: str, input_name: str, detected_variants: set=None, detected_sub_variants: set=None, _form_order=None) -> int:
     _TOKEN_SPLIT = '[\\s\\-+/]+'
     input_upper = input_name.upper().strip()
     pack_positions = get_all_pack_positions(input_upper)
@@ -1624,7 +1838,9 @@ def calculate_product_name_priority_score(product_name: str, input_name: str, de
         if not is_pack_num:
             input_numbers.add(num)
     product_upper = product_name.upper().strip()
-    product_words = {w for w in re.split(_TOKEN_SPLIT, product_upper) if w}
+    form_precedence = _form_precedence(input_name) if _form_order is None else _form_order
+    product_comparison = _form_neutral_text(product_upper, form_precedence, product=True)
+    product_words = {w for w in re.split(_TOKEN_SPLIT, product_comparison) if w}
     _PACK_SHAPE = re.compile('^\\d+[Xx*]\\d+[A-Z]?$|^\\d+[STCP]$|^\\d+PCS?$|^\\d+NOS?$', re.IGNORECASE)
     _UNIT_SUFFIX = re.compile('^(?:MG|ML|GM|MCG|IU|KG)\\.?$', re.IGNORECASE)
 
@@ -1650,21 +1866,21 @@ def calculate_product_name_priority_score(product_name: str, input_name: str, de
         score -= len(extra_numeric_penalized) * 25
     if detected_variants:
         for var in detected_variants:
-            if var != 'PLAIN' and var in product_upper:
+            if var != 'PLAIN' and _form_neutral_text(var, form_precedence) in product_comparison:
                 score += 100
     if detected_sub_variants:
         for sv in detected_sub_variants:
-            if sv != 'PLAIN' and sv in product_upper:
+            if sv != 'PLAIN' and _form_neutral_text(sv, form_precedence) in product_comparison:
                 score += 50
     product_sub_var = 'PLAIN'
-    strength_match = re.search('(\\d+(?:\\.\\d+)?)\\s*(?:MG|GM|ML|MCG|IU|G|KG)\\b', product_upper)
+    strength_match = re.search('(\\d+(?:\\.\\d+)?)\\s*(?:MG|GM|ML|MCG|IU|G|KG)\\b', product_comparison)
     if strength_match:
         product_sub_var = strength_match.group(1)
     else:
         form_words = ['TABLET', 'TABLETS', 'CAPSULE', 'CAPSULES', 'TAB', 'TABS', 'CAP', 'CAPS', 'INJECTION', 'INJ', 'SYRUP', 'SYP', 'SUSPENSION', 'SUSP', 'DROP', 'DROPS', 'CREAM', 'OINTMENT', 'GEL', 'LOTION', 'POWDER', 'GRANULES', 'GRANUL']
         for form in form_words:
             pattern = '(\\d+(?:\\.\\d+)?)\\s+' + re.escape(form) + '\\b'
-            m = re.search(pattern, product_upper)
+            m = re.search(pattern, product_comparison)
             if m:
                 product_sub_var = m.group(1)
                 break
@@ -1692,10 +1908,11 @@ def calculate_product_name_priority_score(product_name: str, input_name: str, de
         score -= 20
     return score
 
-def prioritize_by_product_name_match(items: list, input_name: str, verbose=False) -> list:
+def prioritize_by_product_name_match(items: list, input_name: str, verbose=False, _form_order=None) -> list:
     if len(items) <= 1:
         return items
-    scored_items = [(item, calculate_product_name_priority_score(item['product'], input_name)) for item in items]
+    form_order = _form_precedence(input_name) if _form_order is None else _form_order
+    scored_items = [(item, calculate_product_name_priority_score(item['product'], input_name, _form_order=form_order)) for item in items]
     scored_items.sort(key=lambda x: x[1], reverse=True)
     if verbose:
         print(f'\n  Product name prioritization scores:')
@@ -1703,7 +1920,7 @@ def prioritize_by_product_name_match(items: list, input_name: str, verbose=False
             print(f"    {score}: {item['product'][:50]}")
     return [item for item, _ in scored_items]
 
-def filter_items_by_sub_variant(items: list, detected_sub_variants: set, input_name: str='', reference_items: list=None, verbose=False) -> list:
+def filter_items_by_sub_variant(items: list, detected_sub_variants: set, input_name: str='', reference_items: list=None, verbose=False, _catalog_form_recovery=False) -> list:
     if verbose:
         print('\n' + '=' * 80)
         print('STEP 3: SUB-VARIANT-BASED FILTERING')
@@ -1861,7 +2078,7 @@ def filter_items_by_sub_variant(items: list, detected_sub_variants: set, input_n
             plain_products.append(item)
     if exact_matches:
         if not specific_detected and detected_forms:
-            form_matches = [item for item in exact_matches if detect_dosage_form_in_product(item['product']) & detected_forms or forms_share_group(detect_dosage_form_in_product(item['product']), detected_forms)]
+            form_matches = [item for item in exact_matches if detect_dosage_form_in_product(item['product'], _catalog_form_recovery) & detected_forms or forms_share_group(detect_dosage_form_in_product(item['product'], _catalog_form_recovery), detected_forms)]
             if form_matches:
                 if input_name:
                     return prioritize_by_product_name_match(form_matches, input_name, verbose=verbose)
@@ -1907,47 +2124,96 @@ def filter_items_by_sub_variant(items: list, detected_sub_variants: set, input_n
         return plain_products
     return items
 
+def _dosage_form_mentions(text: str, product=False) -> list:
+    """Bounded aliases in printed order; retain injection presentation identity."""
+    upper = str(text or '').upper()
+    mentions = []
+    for match in _DOSAGE_FORM_PATTERN.finditer(upper):
+        alias = match.group().rstrip('.')
+        # This catalog typo remains restricted to the existing scoped recovery.
+        if product and alias == 'CAPSULS':
+            continue
+        if not product and alias == 'SY' and upper[match.end():match.end() + 1].isdigit():
+            continue  # Legacy SY1X1 pack notation is not an explicit form token.
+        form = _DOSAGE_FORM_ALIASES.get(alias, 'INJECTION')
+        if not product and alias == 'SYR' and match.start() and upper[match.start() - 1].isdigit():
+            form = 'INJECTION'  # Preserve the legacy counted-syringe interpretation.
+        mentions.append((match.start(), match.end(), form))
+    return mentions
+
+
 def detect_dosage_form_in_input(input_name: str, verbose=False) -> set:
+    detected_forms = {form for _, _, form in _dosage_form_mentions(input_name)}
     input_upper = normalize_ocr_numeric_noise(input_name).upper()
-    detected_forms = set()
-    form_patterns = [('\\bDROPS?\\b|\\d+DROPS?\\b|DROPS?[A-Z]*\\b', 'DROPS'), ('\\bSUSPENSIONS?\\b|\\bSUSP\\.?\\b|\\bSUSPN\\b|\\bSYRUPS?\\b|\\bSYP\\.?\\b|\\d+SYP\\b', 'SUSPENSION'), ('\\bTABLETS?\\b|\\bTABS?\\.?\\b|\\bTA\\b|\\d+TABLETS?|\\d+TABS?\\b', 'TABLET'), ('\\bCAPSULES?\\b|\\bCAPS?\\.?\\b|\\d+CAPSULES?|\\d+CAPS?\\b', 'CAPSULE'), ('\\bINJECTIONS?\\b|\\bINJ\\.?\\b|\\bING\\.?\\b|\\d+INJ\\b|\\bVIAL\\b|\\bPFS\\b|\\bAMPS?\\b|\\bSYR\\.?\\b|\\d+SYR\\.?\\b|\\bI\\.?V\\.?\\b', 'INJECTION'), ('\\bCREAMS?\\b|\\bCRM\\.?\\b', 'CREAM'), ('\\bOINTMENTS?\\b|\\bOI\\.?\\b|\\bOINT\\.?\\b', 'OINTMENT'), ('\\bGELS?\\b', 'GEL'), ('\\bSOLUTIONS?\\b|\\bSOL\\.?\\b', 'SOLUTION'), ('\\bPOWDERS?\\b|\\bPOW\\.?\\b', 'POWDER'), ('\\bBARS?\\b|\\bSYNDET\\b', 'BAR'), ('\\bGRANULES?\\b|\\bGRANUL\\b|\\bGRANULS\\b', 'GRANULES'), ('\\bSACHETS?\\b', 'SACHET'), ('\\bLOTIONS?\\b|\\bLOT\\.?\\b|\\bLO\\b', 'LOTION'), ('\\bTONICS?\\b', 'TONIC')]
-    for pattern, form_name in form_patterns:
+    # Keep unrelated topical/bar detection unchanged.
+    for pattern, form in [(r'\bCREAMS?\b|\bCRM\.?\b', 'CREAM'),
+                          (r'\bOINTMENTS?\b|\bOI\.?\b|\bOINT\.?\b', 'OINTMENT'),
+                          (r'\bGELS?\b', 'GEL'), (r'\bBARS?\b|\bSYNDET\b', 'BAR'),
+                          (r'\bLOTIONS?\b|\bLOT\.?\b|\bLO\b', 'LOTION')]:
         if re.search(pattern, input_upper):
-            detected_forms.add(form_name)
-    if not {'SUSPENSION', 'DROPS', 'SOLUTION', 'TONIC'} & detected_forms and re.search('\\bSY\\b', input_upper) and re.search('\\b\\d+(?:\\.\\d+)?\\s*ML\\b', input_upper):
-        detected_forms.add('SUSPENSION')
-    pack_positions = get_all_pack_positions(input_upper)
-
-    def _all_matches_inside_pack(pattern: str) -> bool:
-        matches = list(re.finditer(pattern, input_upper))
-        if not matches:
-            return False
-        return all((is_position_in_pack_pattern(m.start(), m.end(), pack_positions) for m in matches))
-    if 'CAPSULE' in detected_forms and 'TABLET' in detected_forms:
-        tablet_pack_only = _all_matches_inside_pack('\\bTABLETS?\\b|\\bTABS?\\.?\\b|\\bTA\\b|\\d+TABLETS?|\\d+TABS?\\b')
-        capsule_pack_only = _all_matches_inside_pack('\\bCAPSULES?\\b|\\bCAPS?\\.?\\b|\\d+CAPSULES?|\\d+CAPS?\\b')
-        if tablet_pack_only and (not capsule_pack_only):
-            detected_forms.discard('TABLET')
-        elif capsule_pack_only and (not tablet_pack_only):
-            detected_forms.discard('CAPSULE')
+            detected_forms.add(form)
+    if detected_forms & {'VIAL', 'AMPULE'}:
+        detected_forms.add('INJECTION')
     return detected_forms
 
-def detect_dosage_form_in_product(product_name: str) -> set:
+
+def detect_dosage_form_in_product(product_name: str, _catalog_form_recovery=False) -> set:
     product_upper = product_name.upper()
-    detected_forms = set()
-    form_patterns = [('\\bDROPS?\\b', 'DROPS'), ('\\bSUSPENSIONS?\\b|\\bSUSP\\.?\\b|\\bSUSPN\\b|\\bSYRUPS?\\b|\\bSYP\\.?\\b|\\d+SYP\\b|\\bSYR\\.?\\b|\\d+SYR\\.?\\b', 'SUSPENSION'), ('\\bTABLETS?\\b|\\bTABS?\\.?\\b', 'TABLET'), ('\\bCAPSULES?\\b|\\bCAPS?\\.?\\b', 'CAPSULE'), ('\\bINJECTIONS?\\b|\\bINJ\\.?\\b|\\bING\\.?\\b|\\d+INJ\\b|\\bVIAL\\b|\\bPFS\\b|\\bAMPS?\\b|\\bI\\.?V\\.?\\b', 'INJECTION'), ('\\bCREAMS?\\b', 'CREAM'), ('\\bOINTMENTS?\\b', 'OINTMENT'), ('\\bGELS?\\b', 'GEL'), ('\\bSOLUTIONS?\\b|\\bSOL\\b', 'SOLUTION'), ('\\bPOWDERS?\\b', 'POWDER'), ('\\bBARS?\\b|\\bSYNDET\\b', 'BAR'), ('\\bGRANULES?\\b|\\bGRANUL\\b|\\bGRANULS\\b', 'GRANULES'), ('\\bSACHETS?\\b', 'SACHET'), ('\\bLOTIONS?\\b', 'LOTION'), ('\\bTONICS?\\b', 'TONIC')]
-    for pattern, form_name in form_patterns:
+    if _catalog_form_recovery:
+        product_upper = re.sub(r'\bCAPSULS\b', 'CAPSULES', product_upper)
+        product_upper = re.sub(r'\bMGINJECTION\b', 'MG INJECTION', product_upper)
+    detected_forms = {form for _, _, form in _dosage_form_mentions(product_upper, product=True)}
+    for pattern, form in [(r'\bCREAMS?\b', 'CREAM'), (r'\bOINTMENTS?\b', 'OINTMENT'),
+                          (r'\bGELS?\b', 'GEL'), (r'\bBARS?\b|\bSYNDET\b', 'BAR'),
+                          (r'\bLOTIONS?\b', 'LOTION')]:
         if re.search(pattern, product_upper):
-            detected_forms.add(form_name)
+            detected_forms.add(form)
+    if detected_forms & {'VIAL', 'AMPULE'}:
+        detected_forms.add('INJECTION')
     return detected_forms
-_FORM_GROUPS = {'TABLET': 'solid_oral', 'CAPSULE': 'solid_oral', 'SUSPENSION': 'liquid_oral', 'SYRUP': 'liquid_oral', 'SOLUTION': 'liquid_oral', 'DROPS': 'liquid_oral', 'TONIC': 'liquid_oral', 'INJECTION': 'parenteral', 'CREAM': 'topical', 'GEL': 'topical', 'OINTMENT': 'topical', 'LOTION': 'topical', 'POWDER': 'powder', 'GRANULES': 'powder', 'SACHET': 'powder', 'BAR': 'bar'}
+
+
+_FORM_GROUPS = {'TABLET': 'solid_oral', 'CAPSULE': 'solid_oral', 'SUSPENSION': 'liquid_oral', 'SYRUP': 'liquid_oral', 'LIQUID': 'liquid_oral', 'SOLUTION': 'liquid_oral', 'DROPS': 'liquid_oral', 'TONIC': 'liquid_oral', 'INJECTION': 'parenteral', 'VIAL': 'parenteral', 'AMPULE': 'parenteral', 'CREAM': 'topical', 'GEL': 'topical', 'OINTMENT': 'topical', 'LOTION': 'topical', 'POWDER': 'powder', 'GRANULES': 'powder', 'SACHET': 'powder', 'BAR': 'bar'}
+_EQUIVALENT_FORM_GROUPS = {'solid_oral', 'liquid_oral', 'parenteral', 'powder'}
+_NEUTRAL_GROUP_FORM = {'solid_oral': 'TABLET', 'liquid_oral': 'SUSPENSION', 'parenteral': 'INJECTION', 'powder': 'POWDER'}
+
+
+def _form_precedence(input_name: str) -> tuple:
+    forms = detect_dosage_form_in_input(input_name)
+    groups = {_FORM_GROUPS[form] for form in forms if form in _FORM_GROUPS}
+    # First-mention precedence is defined only within one equivalence group.
+    if len(groups) != 1 or not groups.issubset(_EQUIVALENT_FORM_GROUPS):
+        return ()
+    return tuple(dict.fromkeys(form for _, _, form in _dosage_form_mentions(input_name)))
+
+
+def _form_neutral_text(text: str, precedence: tuple, product=False) -> str:
+    if not precedence:
+        return text
+    group = _FORM_GROUPS[precedence[0]]
+    neutral = _NEUTRAL_GROUP_FORM[group]
+    upper = str(text or '').upper()
+    parts, end = [], 0
+    for start, stop, form in _dosage_form_mentions(upper, product=product):
+        if _FORM_GROUPS[form] == group:
+            parts.extend((upper[end:start], neutral))
+            end = stop
+    parts.append(upper[end:])
+    return ''.join(parts)
+
+
+def _final_form_preference(product_name: str, precedence: tuple) -> int:
+    if not precedence:
+        return 0
+    product_forms = {form for _, _, form in _dosage_form_mentions(product_name, product=True)}
+    return next((len(precedence) - i for i, form in enumerate(precedence) if form in product_forms), 0)
 
 def forms_share_group(product_forms: set, detected_forms: set) -> bool:
     product_groups = {_FORM_GROUPS[f] for f in product_forms if f in _FORM_GROUPS}
     detected_groups = {_FORM_GROUPS[f] for f in detected_forms if f in _FORM_GROUPS}
     return bool(product_groups & detected_groups)
 
-def prioritize_by_dosage_form(items: list, detected_forms: set, verbose=False) -> list:
+def prioritize_by_dosage_form(items: list, detected_forms: set, verbose=False, _catalog_form_recovery=False) -> list:
     if not detected_forms:
         return items
     if verbose:
@@ -1956,10 +2222,25 @@ def prioritize_by_dosage_form(items: list, detected_forms: set, verbose=False) -
         print('=' * 80)
         print(f'Detected forms in input: {sorted(detected_forms)}')
     detected_groups = {_FORM_GROUPS[f] for f in detected_forms if f in _FORM_GROUPS}
+    if detected_groups & _EQUIVALENT_FORM_GROUPS:
+        # Keep every recognized equivalent, without promoting an unknown spelling
+        # ahead of recognized forms. Scoped catalog-typo recovery remains intact.
+        equivalent = []
+        for item in items:
+            product_forms = detect_dosage_form_in_product(item['product'], _catalog_form_recovery)
+            product_groups = {_FORM_GROUPS[form] for form in product_forms}
+            if product_forms & detected_forms or product_groups & detected_groups & _EQUIVALENT_FORM_GROUPS:
+                equivalent.append(item)
+        if equivalent:
+            return equivalent
+        compatible = _form_compatible(items, detected_forms, _catalog_form_recovery)
+        if compatible:
+            return compatible
+        return items  # Retain the existing no-compatible-form fallback.
     exact_form_matches = []
     other_products = []
     for item in items:
-        product_forms = detect_dosage_form_in_product(item['product'])
+        product_forms = detect_dosage_form_in_product(item['product'], _catalog_form_recovery)
         if product_forms & detected_forms:
             exact_form_matches.append(item)
         else:
@@ -1972,7 +2253,7 @@ def prioritize_by_dosage_form(items: list, detected_forms: set, verbose=False) -
         non_conflicting = []
         excluded = []
         for item in items:
-            product_forms = detect_dosage_form_in_product(item['product'])
+            product_forms = detect_dosage_form_in_product(item['product'], _catalog_form_recovery)
             product_groups = {_FORM_GROUPS[f] for f in product_forms if f in _FORM_GROUPS}
             if product_groups and product_groups.isdisjoint(detected_groups):
                 excluded.append(item)
@@ -1984,18 +2265,124 @@ def prioritize_by_dosage_form(items: list, detected_forms: set, verbose=False) -
             return non_conflicting
     return items
 
-def _form_compatible(items: list, detected_forms: set) -> list:
+def _form_compatible(items: list, detected_forms: set, _catalog_form_recovery=False) -> list:
     detected_groups = {_FORM_GROUPS[f] for f in detected_forms if f in _FORM_GROUPS}
     if not detected_groups:
         return list(items)
     keep = []
     for item in items:
-        product_groups = {_FORM_GROUPS[f] for f in detect_dosage_form_in_product(item['product']) if f in _FORM_GROUPS}
+        product_groups = {_FORM_GROUPS[f] for f in detect_dosage_form_in_product(item['product'], _catalog_form_recovery) if f in _FORM_GROUPS}
         if not product_groups or product_groups & detected_groups:
             keep.append(item)
     return keep
 
-def filter_items_by_pack_size(items: list, input_pack_size: str, reference_items: list=None, verbose=False) -> list:
+def _input_pack_measurement(input_name: str, items: list):
+    requested = _extract_pack_size(input_name, with_measurement=True)
+    if requested and requested[1] != 'COUNT':
+        dimensions = {pack[1] for item in items if (pack := parse_master_pack(item.get('pack_size', '')))}
+        if dimensions and requested[1] not in dimensions:
+            # A content mass (20G/50ML) must not hide the catalog's liquid pack.
+            compatible_text = _PACK_MEASUREMENT.sub(
+                lambda match: match.group() if (value := measurement(*match.groups())) and value[1] in dimensions else ' ',
+                input_name.upper())
+            compatible = _extract_pack_size(compatible_text, with_measurement=True)
+            if compatible and compatible[1] in dimensions:
+                return compatible
+        return requested
+    if not requested and not any(unit in input_name.upper() for unit in ('MG', 'MCG', 'IU', 'UNIT')):
+        return None
+    dimensions = {pack[1] for item in items if (pack := parse_master_pack(item.get('pack_size', '')))}
+    if requested and requested[1] == 'COUNT' and not any(d.startswith('COUNT') for d in dimensions):
+        return None  # Unitless multipliers do not establish a liquid/mass quantity.
+    if requested:
+        return requested
+    # MG/MCG/IU can be packaging only when the catalog establishes that dimension
+    # and the printed number has not already been used as a numeric sub-variant.
+    if dimensions & {'MASS', 'ACTIVITY'}:
+        for match in re.finditer(r'(?<![A-Z0-9.])(\d+(?:\.\d+)?|\.\d+)\s*(MCG|MG|IU|UNIT)\b', input_name.upper()):
+            if any(is_numeric_subvariant_like(item.get('sub_variant', '')) for item in items):
+                continue
+            candidate = measurement(match[1], match[2])
+            if candidate and candidate[1] in dimensions:
+                return candidate
+    return None
+
+
+_PACK_BRAND_CACHE = (None, {})
+
+
+def _pack_source_brands(brand_map):
+    global _PACK_BRAND_CACHE
+    cached_map, sources = _PACK_BRAND_CACHE
+    if cached_map is not brand_map:
+        sources = {id(item): brand for brand, items in brand_map.items() for item in items}
+        _PACK_BRAND_CACHE = (brand_map, sources)
+    return sources
+
+
+def _input_variant_tokens_outside_packs(input_name, brand, variants):
+    """Do not let letters printed only inside packs establish another variant."""
+    descriptor = strip_brand_from_input(normalize_ocr_numeric_noise(input_name), brand, variants)
+    for start, end in reversed(get_all_pack_positions(descriptor)):
+        if end and descriptor[end - 1].isdigit():
+            suffix = re.match(r'\s*[STCP]\b', descriptor[end:])
+            if suffix:
+                end += suffix.end()
+        descriptor = descriptor[:start] + ' ' * (end - start) + descriptor[end:]
+    return extract_variant_match_tokens(descriptor)
+
+
+def _explicit_variant_items_before_pack(items, input_name, brand):
+    variants = {str(item.get('variant', 'PLAIN')).upper() for item in items}
+    tokens = _input_variant_tokens_outside_packs(input_name, brand, variants)
+    explicit = [item for item in items if (required := _variant_identity_tokens(str(item.get('variant', 'PLAIN')).upper()))
+                and required.issubset(tokens)]
+    return explicit if explicit else items
+
+
+def filter_items_by_pack_size(items: list, input_pack_size: str, reference_items: list=None, verbose=False,
+                              _keep_form_ties=False, _measurement=None, _legacy=False) -> list:
+    if _legacy or not input_pack_size:
+        return _filter_items_by_pack_size_legacy(items, input_pack_size, reference_items, verbose, _keep_form_ties)
+    numbered, blank = [], []
+    units = set()
+    for item in items:
+        pack = str(item.get('pack_size', '')).strip()
+        if not pack or pack.upper() in {'NAN', 'NONE'}:
+            blank.append(item)
+        elif parsed := parse_master_pack(pack):
+            numbered.append((item, parsed))
+            units.add(re.sub(r'[^A-Z]', '', pack.upper()) or 'COUNT')
+        else:
+            return []  # A malformed master pack is not a valid base presentation.
+    requested = _measurement or parse_master_pack(str(input_pack_size))
+    if requested is None and re.fullmatch(r'\d+(?:\.\d+)?', str(input_pack_size)):
+        if len(units) == 1:
+            requested = measurement(input_pack_size, next(iter(units)))
+        elif not numbered:
+            requested = measurement(input_pack_size, 'COUNT')
+    if requested is None:
+        return []
+    identities = {(str(item.get('variant', 'PLAIN')).upper(), str(item.get('sub_variant', 'PLAIN')).upper()) for item in items}
+    if len(identities) != 1:
+        return []
+    if not numbered and blank:
+        form_groups = {
+            'VOLUME': {_FORM_GROUPS['SYRUP'], _FORM_GROUPS['INJECTION']},
+            'COUNT_ORAL': {_FORM_GROUPS['TABLET']},
+            'COUNT_INJECTION': {_FORM_GROUPS['INJECTION']},
+        }.get(requested[1])
+        if form_groups:
+            blank = [item for item in blank
+                     if not (groups := {_FORM_GROUPS[form] for form in detect_dosage_form_in_product(item['product'])})
+                     or groups & form_groups]
+    selected, refusal = select_pack_rows(numbered, blank, requested)
+    if verbose:
+        print(f'  [PACK] Exact / lower / lowest: {len(items)} -> {len(selected)} ({refusal or requested})')
+    return selected
+
+
+def _filter_items_by_pack_size_legacy(items: list, input_pack_size: str, reference_items: list=None, verbose=False, _keep_form_ties=False) -> list:
     if verbose:
         print('\n' + '=' * 80)
         print('STEP 5: PACK SIZE FILTERING')
@@ -2023,6 +2410,8 @@ def filter_items_by_pack_size(items: list, input_pack_size: str, reference_items
             return products_without_pack
         if products_with_pack:
             products_with_pack.sort(key=lambda x: x[1])
+            if _keep_form_ties:
+                return [item for item, pn in products_with_pack if pn == products_with_pack[0][1]]
             return [item for item, _ in products_with_pack[:1]]
         return items
     try:
@@ -2042,6 +2431,8 @@ def filter_items_by_pack_size(items: list, input_pack_size: str, reference_items
         if closest_diff <= input_pack_num * 0.5 or closest_diff <= 20:
             if verbose:
                 print(f'\n[OK] No exact pack match and no base products -- using closest pack {closest[1]} (diff={closest_diff})')
+            if _keep_form_ties:
+                return [item for item, pn in products_with_pack if pn == closest[1]]
             return [closest[0]]
     return items
 
@@ -2060,34 +2451,38 @@ def _clean_input_for_fuzzy(input_name: str) -> str:
 def rank_local_candidates(items: list, input_name: str, detected_variants: set=None, detected_sub_variants: set=None) -> list:
     if not items:
         return []
-    ranked_items = prioritize_by_product_name_match(items, input_name, verbose=False)
+    form_precedence = _form_precedence(input_name)
+    ranked_items = prioritize_by_product_name_match(items, input_name, verbose=False, _form_order=form_precedence)
     if len(ranked_items) == 1:
         return [(100.0, ranked_items[0])]
-    input_norm = norm(input_name)
-    input_clean = _clean_input_for_fuzzy(input_name)
+    input_clean = _clean_input_for_fuzzy(_form_neutral_text(input_name, form_precedence))
     input_tokens_upper = set(re.findall('[A-Z0-9]+', input_clean.upper())) | set(re.findall('[A-Z]+', input_clean.upper()))
-    KNOWN_GHOST_TOKENS = {token for candidate in ranked_items for field in ('variant', 'sub_variant') for token in re.findall('[A-Z]+', str(candidate.get(field, '')).upper()) if token != 'PLAIN' and token not in FORM_HINT_TOKENS and (token not in DOSAGE_UNIT_SUFFIXES)}
+    KNOWN_GHOST_TOKENS = {token for candidate in ranked_items for field in ('variant', 'sub_variant') for token in re.findall('[A-Z]+', _form_neutral_text(str(candidate.get(field, '')).upper(), form_precedence, product=True)) if token != 'PLAIN' and token not in FORM_HINT_TOKENS and (token not in DOSAGE_UNIT_SUFFIXES)}
     scored_items = []
     for item in ranked_items:
-        product_norm = norm(item['product'])
+        product_text = _form_neutral_text(item['product'], form_precedence, product=True)
+        product_norm = norm(product_text)
         fuzzy_score = max(fuzz.token_sort_ratio(input_clean, product_norm), fuzz.token_set_ratio(input_clean, product_norm), fuzz.ratio(input_clean, product_norm))
-        priority_score = calculate_product_name_priority_score(item['product'], input_name, detected_variants, detected_sub_variants)
+        priority_score = calculate_product_name_priority_score(item['product'], input_name, detected_variants, detected_sub_variants, _form_order=form_precedence)
         alpha_ghost_penalty = 0
         item_sv = str(item.get('sub_variant', 'PLAIN')).strip().upper() or 'PLAIN'
+        item_sv = _form_neutral_text(item_sv, form_precedence, product=True)
         if item_sv != 'PLAIN' and re.match('^[A-Z]+$', item_sv) and (item_sv not in input_tokens_upper):
             alpha_ghost_penalty = -200
         item_v = str(item.get('variant', 'PLAIN')).strip().upper() or 'PLAIN'
+        item_v = _form_neutral_text(item_v, form_precedence, product=True)
         if item_v != 'PLAIN' and re.match('^[A-Z ]+$', item_v):
             v_words = set(item_v.split())
             if not v_words.issubset(input_tokens_upper):
                 alpha_ghost_penalty -= 150
-        product_tokens = set(re.findall('[A-Z]+', item['product'].upper()))
+        product_tokens = set(re.findall('[A-Z]+', product_text.upper()))
         ghost_in_product = (product_tokens & KNOWN_GHOST_TOKENS) - input_tokens_upper
         if ghost_in_product:
             alpha_ghost_penalty -= 120 * len(ghost_in_product)
         score = fuzzy_score + priority_score + alpha_ghost_penalty
         scored_items.append((score, item))
-    scored_items.sort(key=lambda x: x[0], reverse=True)
+    # A form preference never outweighs identity/strength/pack suitability.
+    scored_items.sort(key=lambda x: (x[0], _final_form_preference(x[1]['product'], form_precedence)), reverse=True)
     return scored_items
 
 def choose_best_local_candidate(items: list, input_name: str, detected_variants: set=None, detected_sub_variants: set=None) -> dict:
@@ -2251,8 +2646,96 @@ def filter_items_prefer_exact_brand_token(items: list, brand: str, input_name: s
         return exact
     return items
 
+def _explicit_form_recovery_strength(input_name: str, brand: str) -> str:
+    """Limit catalog-form recovery to the verified explicit-strength families."""
+    upper = input_name.upper()
+    if brand == 'ENZELO':
+        strengths = set(re.findall(r'(?<!\d)(10000|25000)(?!\d)', upper))
+        if (len(strengths) == 1 and not re.search(r'(?<!\d)(150|300)(?!\d)', upper)
+                and detect_dosage_form_in_input(input_name) & {'TABLET', 'CAPSULE'}):
+            return next(iter(strengths))
+    elif brand == 'SCUD':
+        if (re.search(r'(?<!\d)250(?!\d)', upper)
+                and not re.search(r'\bXP\b', upper)
+                and not re.search(r'(?<!\d)(?:500|750|1000|1(?:\.5)?)\s*(?:MG|GM)\b', upper)
+                and 'INJECTION' in detect_dosage_form_in_input(input_name)):
+            return '250'
+    return ''
+
+
+def _expand_supported_glued_dt(input_name: str, items: list) -> str:
+    matches = list(re.finditer(r'(?<![\d.])(\d+(?:\.\d+)?)DT\b', input_name.upper()))
+    if not matches:
+        return input_name
+    tokens = set(re.findall(r'[A-Z]+', input_name.upper()))
+    strengths = {str(item['sub_variant']) for item in items
+                 if 'DT' in item['variant'].split()
+                 and set(item['variant'].split()).issubset(tokens)}
+    if all(match[1] in strengths for match in matches):
+        return re.sub(r'(?<![\d.])(\d+(?:\.\d+)?)DT\b', r'\1 DT', input_name, flags=re.I)
+    return input_name
+
+
 def process_product(input_name: str, brand_map: dict, all_variants: set=None, all_sub_variants: set=None, client=None, verbose=False, _lower_variant_retry=False, forced_brand: str=None, auto_detect: bool=False) -> dict:
+    raw_input = str(input_name or '').strip()
+    hint = str(forced_brand or '').strip().upper()
+    if hint == 'PRO-DIOF' or not hint and auto_detect and 'DIOF' in raw_input.upper():
+        description = parse_pro_diof_description(raw_input)
+        if description is not None:
+            # Keep the established matching pass and its complete diagnostics.
+            # New descriptor recovery never promotes previously rejected unknown
+            # text; existing accepted descriptions still receive the pack policy.
+            existing = _process_product_core(raw_input, brand_map, all_variants, all_sub_variants, client,
+                                             verbose=verbose, _lower_variant_retry=_lower_variant_retry,
+                                             forced_brand=forced_brand, auto_detect=auto_detect)
+            if existing.get('product_code') and (description.error == 'VARIANT_NOT_IN_MASTER'
+                                                  or description.five_ml and description.error == 'UNSUPPORTED_PRO_DIOF_QUANTITY'):
+                description = replace(description, error='')
+            item, refusal = select_pro_diof_presentation(description, brand_map)
+            if item is None:
+                return make_result('NO_CLEAR_MATCH', status=refusal, confidence='NONE')
+            if existing.get('product_code') == item['product_code'] and existing.get('output') == item['product']:
+                return existing
+            return make_result(item['product'], item['product_code'], status='MATCHED', confidence='HIGH',
+                               candidate_count=1, suggestions=[{'product': item['product'],
+                                                               'product_code': item['product_code'], 'score': 100.0}])
+    if hint == 'BEVON' and 'SOFT' in raw_input.upper():
+        targets = [item for item in brand_map.get('BEVON', [])
+                   if str(item.get('product', '')).strip().upper() == 'BEVON SOFTULES']
+        if len(targets) != 1:
+            raise ValueError('BEVON SOFT exception requires exactly one BEVON SOFTULES master product.')
+        item = targets[0]
+        return make_result(item['product'], item['product_code'], status='MATCHED', confidence='HIGH',
+                           candidate_count=1, suggestions=[{'product': item['product'],
+                                                           'product_code': item['product_code'], 'score': 100.0}])
+    # These corrections require the confirmed catalog hint used by app.py.
+    scoped_items = brand_map.get(forced_brand, [])
+    strength = _explicit_form_recovery_strength(raw_input, forced_brand) if scoped_items else ''
+    exclude_forte = bool(scoped_items and forced_brand == 'C - TAX'
+                         and re.search(r'\bO\b.*\bDRY\b', raw_input.upper())
+                         and not re.search(r'\bFORT(?:E|S)?\b', raw_input.upper()))
+    prepared = _expand_supported_glued_dt(raw_input, scoped_items) if scoped_items else raw_input
+    options = dict(verbose=verbose, _lower_variant_retry=_lower_variant_retry,
+                   forced_brand=forced_brand, auto_detect=auto_detect,
+                   _exclude_inferred_forte=exclude_forte)
+    result = _process_product_core(prepared, brand_map, all_variants, all_sub_variants, client, **options)
+    if strength:
+        recovered = _process_product_core(prepared, brand_map, all_variants, all_sub_variants, client,
+                                          _catalog_form_recovery=True, **options)
+        # Keep original catalog identities and reject recovery to another variant/strength.
+        if any(item['variant'] == 'PLAIN' and str(item['sub_variant']) == strength
+               and item['product_code'] == recovered.get('product_code')
+               and item['product'] == recovered.get('output') for item in scoped_items):
+            return recovered
+    return result
+
+
+def _process_product_core(input_name: str, brand_map: dict, all_variants: set=None, all_sub_variants: set=None, client=None, verbose=False, _lower_variant_retry=False, forced_brand: str=None, auto_detect: bool=False, _catalog_form_recovery=False, _exclude_inferred_forte=False) -> dict:
     input_name = str(input_name or '').strip()
+    if 'CORLION' in input_name.upper():
+        alias = resolve_source_brand_alias(input_name, brand_map)
+        if alias and (not forced_brand or compact_brand_token(forced_brand) == compact_brand_token(alias)):
+            input_name = replace_source_brand_alias(input_name, alias)
     exact_items = _get_exact_catalog_index(brand_map).get(norm(input_name), [])
     if len(exact_items) == 1:
         item = exact_items[0]
@@ -2306,6 +2789,9 @@ def process_product(input_name: str, brand_map: dict, all_variants: set=None, al
         if verbose:
             print(f"  [forced_brand] No brand hint for '{input_name[:50]}' -> NO_CLEAR_MATCH")
         return make_result('NO_CLEAR_MATCH', '', status='NO_BRAND', confidence='NONE', candidate_count=0, suggestions=[])
+    if not brand and auto_detect and _FORTE_HINT.search(input_name):
+        brand = _recover_forte_glued_brand(input_name, brand_map)
+        items = list(brand_map[brand]) if brand else []
     if not brand:
         suggestions = suggest_nearest_brands(input_name, brand_map)
         top, dist = nearest_brand_within_edits(input_name, suggestions)
@@ -2316,8 +2802,20 @@ def process_product(input_name: str, brand_map: dict, all_variants: set=None, al
         if verbose:
             print(f'\nNO_CLEAR_MATCH: no brand within {NO_BRAND_RECOVERY_MAX_EDITS} edits (nearest gap {dist})')
         return make_result('NO_CLEAR_MATCH', '', status='NO_BRAND', confidence='NONE', candidate_count=0, suggestions=suggestions)
+    forte_input = False
+    if _FORTE_HINT.search(input_name) and compact_brand_token(brand) != 'PRODIOF':
+        input_name, items, forte_input, refusal = _prepare_forte_candidates(input_name, brand, items)
+        if refusal:
+            return make_result('NO_CLEAR_MATCH', '', status=refusal, confidence='NONE', candidate_count=0, suggestions=[])
+    if forte_input:
+        _exclude_inferred_forte = False
+    elif compact_brand_token(brand) == 'CTAX' and re.search(r'\bO\b.*\bDRY\b', input_name.upper()):
+        _exclude_inferred_forte = True
     _input_forms = detect_dosage_form_in_input(input_name, verbose=False)
-    items = prioritize_by_dosage_form(items, _input_forms, verbose=verbose)
+    if _catalog_form_recovery and _input_forms & {'TABLET', 'CAPSULE'}:
+        _input_forms = _input_forms | {'TABLET', 'CAPSULE'}
+    items = prioritize_by_dosage_form(items, _input_forms, verbose=verbose,
+                                     _catalog_form_recovery=_catalog_form_recovery)
     compound_tokens = extract_brand_suffix_tokens(input_name, brand)
     compound_token_digits = get_compound_token_digits(compound_tokens)
     compound_token_letters = set()
@@ -2347,54 +2845,140 @@ def process_product(input_name: str, brand_map: dict, all_variants: set=None, al
     orphan_quals = find_unmatched_qualifier_tokens(normalized_for_qual, brand, available_variants, available_sub_variants, brand_items=brand_scope_items)
     if compound_token_letters:
         orphan_quals = [q for q in orphan_quals if q not in compound_token_letters]
+    forte_conflicts = set()
+    if forte_input:
+        # Qualifier scanning stops at the first form; explicit conflicting identity
+        # tokens remain disqualifying even when printed after that form.
+        variant_tokens, subvariant_tokens = _variant_subvariant_tokens(brand_map)
+        source_items = brand_map.get(brand, ())
+        identity_tokens = _variant_vocabulary(tuple(str(item.get(field, 'PLAIN')).upper()
+                                                   for item in source_items for field in ('variant', 'sub_variant')))
+        protected = {token for token in variant_tokens | subvariant_tokens | identity_tokens
+                     if not token.isdigit()} - _pack_form_skip_tokens() - {'PLAIN'}
+        active = _variant_vocabulary(tuple(sorted(available_variants | available_sub_variants)))
+        printed = _input_variant_tokens_outside_packs(input_name, brand, available_variants)
+        forte_conflicts = ((printed | set(orphan_quals)) & protected) - active
+        if 'OF' in forte_conflicts and re.search(r'\b(?:BOTTLES?|PACK)\s+OF\s+\d', normalized_for_qual):
+            forte_conflicts.discard('OF')
+        orphan_quals += sorted(forte_conflicts - set(orphan_quals))
     if orphan_quals:
+        def _retry_nasal_abbreviation(result):
+            # Preserve successful existing matches and expand only a complete phrase.
+            if result.get('product_code') or result.get('status') != 'VARIANT_NOT_IN_MASTER' or '/' not in input_name:
+                return result
+            expanded = _NASAL_SPRAY_ABBREVIATION.sub('NASAL SPRAY', input_name)
+            if expanded == input_name:
+                return result
+            recovered = _process_product_core(expanded, brand_map, all_variants, all_sub_variants, client,
+                                        verbose=verbose, _lower_variant_retry=_lower_variant_retry,
+                                        forced_brand=forced_brand, auto_detect=auto_detect,
+                                        _catalog_form_recovery=_catalog_form_recovery,
+                                        _exclude_inferred_forte=_exclude_inferred_forte)
+            if recovered.get('status') != 'MATCHED' or recovered.get('confidence') != 'HIGH':
+                return result
+            descriptor_text = strip_brand_from_input(expanded, brand, available_variants)
+            if descriptor_text == expanded.upper().strip():
+                return result
+            descriptors = extract_variant_match_tokens(descriptor_text) - _pack_form_skip_tokens()
+            if not descriptors.issubset(extract_variant_match_tokens(recovered['output'])):
+                return result
+            quantity_pattern = r'(?<![\d.])(\d+(?:\.\d+)?)\s*(MCG|MG|GM|ML|KG|MD|G|L)\b'
+            catalog_quantities = {(float(number), 'GM' if unit == 'G' else unit)
+                                  for number, unit in re.findall(quantity_pattern, recovered['output'].upper())}
+            if catalog_quantities and any(
+                    (float(number), 'GM' if unit == 'G' else unit) not in catalog_quantities
+                    for number, unit in re.findall(quantity_pattern, expanded.upper())):
+                return result
+            non_identity_suffixes = DOSAGE_UNIT_SUFFIXES | {'G', 'L', 'KG', 'S', 'T', 'C', 'P', 'X'}
+            for number, suffix in re.findall(r'(?<![\d.])(\d+(?:\.\d+)?)\s*([A-Z]+)\b', expanded.upper()):
+                if suffix not in non_identity_suffixes and not re.search(
+                        r'(?<![\d.])' + re.escape(number) + r'\s*' + re.escape(suffix) + r'\b', recovered['output'].upper()):
+                    return result
+            return recovered
+
         numeric_orphan = any((any((ch.isdigit() for ch in o)) for o in orphan_quals))
-        if not _lower_variant_retry and (not numeric_orphan):
+        forte_retry_safe = False
+        if forte_input:
+            identities = {(item['variant'], item['sub_variant']) for item in brand_scope_items}
+            forte_retry_safe = len(identities) == 1 and not forte_conflicts
+        if not _lower_variant_retry and (not forte_input or forte_retry_safe) and (not numeric_orphan):
             stripped = input_name
             for o in orphan_quals:
                 stripped = re.sub('\\b' + re.escape(o) + '\\b', ' ', stripped)
             stripped = re.sub('\\s+', ' ', stripped).strip()
-            lower_vars = detect_variants_in_input(stripped, brand, available_variants, verbose=False)
+            lower_vars = detect_variants_in_input(stripped, brand, available_variants, verbose=False,
+                                                  _exclude_inferred_forte=_exclude_inferred_forte)
             if stripped and stripped != input_name and any((v != 'PLAIN' for v in lower_vars)):
-                res = process_product(stripped, brand_map, all_variants, all_sub_variants, client, verbose=verbose, _lower_variant_retry=True, forced_brand=forced_brand, auto_detect=auto_detect)
+                res = _process_product_core(stripped, brand_map, all_variants, all_sub_variants, client, verbose=verbose, _lower_variant_retry=True, forced_brand=forced_brand, auto_detect=auto_detect, _catalog_form_recovery=_catalog_form_recovery, _exclude_inferred_forte=_exclude_inferred_forte)
+                if forte_input and res.get('product_code') and not any(
+                        item['product_code'] == res['product_code'] and item['product'] == res['output']
+                        for item in brand_scope_items):
+                    return make_result('NO_CLEAR_MATCH', '', status='VARIANT_NOT_IN_MASTER', confidence='NONE')
                 if res['status'] == 'MATCHED' and res['output'] != 'NO_CLEAR_MATCH':
                     if verbose:
                         print(f"\nRECOVERED (lower variant): '{brand}' lacks {orphan_quals}; mapped to lower variant '{res['output']}'")
                     res['status'] = 'RECOVERED_LOWER_VARIANT'
                     res['confidence'] = 'LOW'
-                return res
+                return _retry_nasal_abbreviation(res)
         suggestions = build_item_suggestions(brand_scope_items, input_name)
         if verbose:
             print(f"\nNO_CLEAR_MATCH: qualifier {orphan_quals} is not a known variant/sub-brand of '{brand}' in the master")
-        return make_result('NO_CLEAR_MATCH', '', status='VARIANT_NOT_IN_MASTER', confidence='NONE', candidate_count=len(brand_scope_items), suggestions=suggestions)
-    detected_variants = detect_variants_in_input(input_name, brand, available_variants, compound_token_letters=compound_token_letters, verbose=verbose, brand_items=brand_scope_items)
+        return _retry_nasal_abbreviation(make_result('NO_CLEAR_MATCH', '', status='VARIANT_NOT_IN_MASTER', confidence='NONE', candidate_count=len(brand_scope_items), suggestions=suggestions))
+    detected_variants = detect_variants_in_input(input_name, brand, available_variants, compound_token_letters=compound_token_letters, verbose=verbose, brand_items=brand_scope_items, _exclude_inferred_forte=_exclude_inferred_forte)
     _before_var = items
     items = filter_items_by_variant(items, detected_variants, reference_items=brand_scope_items, verbose=verbose)
-    if _input_forms and items and (not _form_compatible(items, _input_forms)):
-        _pool = _form_compatible(_before_var, _input_forms)
+    if _input_forms and items and (not _form_compatible(items, _input_forms, _catalog_form_recovery)):
+        _pool = _form_compatible(_before_var, _input_forms, _catalog_form_recovery)
         if _pool:
             _retry = filter_items_by_variant(_pool, detected_variants, reference_items=_pool, verbose=verbose)
             if _retry:
                 items = _retry
-    detected_sub_variants = detect_sub_variants_in_input(input_name, brand, available_sub_variants, available_variants, compound_token_digits=compound_token_digits, verbose=verbose)
+    # A newly eligible equivalent form may introduce a sibling variant (e.g. O
+    # drops beside O DRY syrup). Do not parse its O 50 as this variant's strength.
+    strength_variants = available_variants
+    if items and any(_FORM_GROUPS.get(form) in _EQUIVALENT_FORM_GROUPS for form in _input_forms):
+        strength_variants, _, _ = extract_available_attributes_from_items(items)
+    detected_sub_variants = detect_sub_variants_in_input(input_name, brand, available_sub_variants, strength_variants, compound_token_digits=compound_token_digits, verbose=verbose)
     _before_sv = items
-    items = filter_items_by_sub_variant(items, detected_sub_variants, input_name, reference_items=brand_scope_items, verbose=verbose)
-    if _input_forms and items and (not _form_compatible(items, _input_forms)):
-        _pool = _form_compatible(_before_sv, _input_forms)
+    items = filter_items_by_sub_variant(items, detected_sub_variants, input_name, reference_items=brand_scope_items, verbose=verbose, _catalog_form_recovery=_catalog_form_recovery)
+    if _input_forms and items and (not _form_compatible(items, _input_forms, _catalog_form_recovery)):
+        _pool = _form_compatible(_before_sv, _input_forms, _catalog_form_recovery)
         if _pool:
-            _retry = filter_items_by_sub_variant(_pool, detected_sub_variants, input_name, reference_items=_pool, verbose=verbose)
+            _retry = filter_items_by_sub_variant(_pool, detected_sub_variants, input_name, reference_items=_pool, verbose=verbose, _catalog_form_recovery=_catalog_form_recovery)
             if _retry:
                 items = _retry
     _before_ns = items
     items = filter_items_by_name_strength(items, input_name, verbose=verbose)
-    if _input_forms and items and (not _form_compatible(items, _input_forms)):
-        _pool = _form_compatible(_before_ns, _input_forms)
+    if _input_forms and items and (not _form_compatible(items, _input_forms, _catalog_form_recovery)):
+        _pool = _form_compatible(_before_ns, _input_forms, _catalog_form_recovery)
         if _pool:
             _retry = filter_items_by_name_strength(_pool, input_name, verbose=verbose)
             if _retry:
                 items = _retry
-    input_pack_size = extract_pack_size_from_input(input_name)
-    items = filter_items_by_pack_size(items, input_pack_size, reference_items=brand_scope_items, verbose=verbose)
+    legacy_pack = compact_brand_token(brand) == 'PRODIOF'
+    requested_pack = None if legacy_pack else _input_pack_measurement(input_name, items)
+    input_pack_size = extract_pack_size_from_input(input_name) if legacy_pack else str(requested_pack[0]) if requested_pack else ''
+    if requested_pack:
+        sources = _pack_source_brands(brand_map)
+        identities = {(sources.get(id(item), brand), str(item.get('variant', 'PLAIN')).upper(),
+                       str(item.get('sub_variant', 'PLAIN')).upper()) for item in items}
+        if len(identities) > 1:
+            items = _explicit_variant_items_before_pack(items, input_name, brand)
+            identities = {(sources.get(id(item), brand), str(item.get('variant', 'PLAIN')).upper(),
+                           str(item.get('sub_variant', 'PLAIN')).upper()) for item in items}
+            if len(identities) > 1:
+                return make_result('NO_CLEAR_MATCH', '', status='AMBIGUOUS_PACK_IDENTITY', confidence='NONE',
+                                   candidate_count=len(items), suggestions=build_item_suggestions(items, input_name))
+    items = filter_items_by_pack_size(items, input_pack_size, reference_items=brand_scope_items, verbose=verbose,
+                                      _keep_form_ties=bool(_form_precedence(input_name)),
+                                      _measurement=requested_pack, _legacy=legacy_pack)
+    if requested_pack and not items:
+        return make_result('NO_CLEAR_MATCH', '', status='NO_COMPATIBLE_PACK', confidence='NONE', candidate_count=0)
+    if forte_input:
+        valid = [item for item in items if str(item.get('product_code', '')).strip() not in {'', '0', '1', 'nan', 'None'}]
+        if len(valid) != 1 or len(items) != 1:
+            return make_result('NO_CLEAR_MATCH', '', status='AMBIGUOUS_FORTE_TARGET' if len(items) > 1 else 'MISSING_FORTE_TARGET',
+                               confidence='NONE', candidate_count=len(items), suggestions=build_item_suggestions(items, input_name))
     if has_ambiguous_missing_strength(items, detected_sub_variants):
         suggestions = build_item_suggestions(items, input_name)
         if verbose:
@@ -2411,9 +2995,20 @@ def process_product(input_name: str, brand_map: dict, all_variants: set=None, al
             print('\n[FAIL] No products left after filtering')
         return make_result('NO_CLEAR_MATCH', '', status='NO_CANDIDATES', confidence='NONE', candidate_count=0, suggestions=suggestions)
     local_ranked = rank_local_candidates(items, input_name, detected_variants, detected_sub_variants)
+    if requested_pack and len(local_ranked) > 1:
+        order = _form_precedence(input_name) or _form_precedence(normalize_ocr_numeric_noise(input_name))
+        # Reuse the existing presentation tie-breaker, including OCR form aliases.
+        local_ranked.sort(key=lambda pair: (pair[0], _final_form_preference(pair[1]['product'], order)), reverse=True)
     local_best_item = local_ranked[0][1] if local_ranked else None
     local_best_score = local_ranked[0][0] if local_ranked else 0
     local_second_score = local_ranked[1][0] if len(local_ranked) > 1 else None
+    strong_local_match = local_best_score >= 90 and (local_second_score is None or local_best_score - local_second_score >= 8)
+    if requested_pack and len(local_ranked) > 1 and not strong_local_match:
+        tied = [item for score, item in local_ranked if score == local_best_score]
+        preferences = [_final_form_preference(item['product'], order) for item in tied]
+        if len(tied) < 2 or preferences.count(max(preferences)) != 1:
+            return make_result('NO_CLEAR_MATCH', '', status='AMBIGUOUS_PACK_TARGET', confidence='NONE',
+                               candidate_count=len(items), suggestions=_suggestions_from_ranked(local_ranked))
     if verbose and local_ranked:
         print('\n' + '=' * 80)
         print('LOCAL FINAL CANDIDATE RANKING')
@@ -2427,7 +3022,7 @@ def process_product(input_name: str, brand_map: dict, all_variants: set=None, al
                 print('\n[OK] Single candidate -- skipping reranker')
             formatted_output = format_output_with_pack_size(local_best_item['product'], input_name, local_best_item.get('pack_size', ''))
             return make_result(formatted_output, local_best_item.get('product_code', ''), status='MATCHED', confidence='HIGH', candidate_count=len(items), suggestions=local_suggestions)
-        if local_best_score >= 90 and (local_second_score is None or local_best_score - local_second_score >= 8):
+        if strong_local_match:
             if verbose:
                 print('\n[OK] Strong local match -- skipping reranker')
             formatted_output = format_output_with_pack_size(local_best_item['product'], input_name, local_best_item.get('pack_size', ''))
@@ -2473,23 +3068,85 @@ def review_highlighted_output_file(output_xlsx_path: str, suggestions_xlsx_path:
     print(f'[OK] Reviewed {highlighted_count} rows, suggested {changed_count} changes')
     return suggestions_xlsx_path
 
+class _MappingSheetWriter:
+    """Maintain a workbook exclusively in its saver thread, retaining other sheets."""
+
+    def __init__(self, workbook_path, columns, initial_rows):
+        self.path = Path(workbook_path)
+        self.columns = tuple(columns)
+        self.initial_rows = tuple(initial_rows)
+        self._workbook = None
+        self._sheet = None
+        self._applied = 0
+        self._image_payloads = []
+
+    def _write_row(self, row_idx, values):
+        for col_idx, value in enumerate(values, 1):
+            self._sheet.cell(row=row_idx, column=col_idx).value = (
+                '' if isinstance(value, float) and value != value else value
+            )
+
+    def _open(self):
+        try:
+            wb = load_workbook(self.path)
+        except FileNotFoundError:
+            wb = Workbook()
+            for name in wb.sheetnames:
+                if name in ('Sheet', 'Sheet1'):
+                    del wb[name]
+        if 'mapping' in wb.sheetnames:
+            del wb['mapping']
+        self._workbook = wb
+        self._sheet = wb.create_sheet('mapping')
+        try:
+            for sheet in wb:
+                for image in sheet._images:
+                    payload = image.ref.getvalue() if isinstance(image.ref, BytesIO) else image._data()
+                    self._image_payloads.append((image, payload))
+            self._write_row(1, self.columns)
+            for row_idx, values in enumerate(self.initial_rows, 2):
+                self._write_row(row_idx, values)
+        except BaseException:
+            self.close()
+            raise
+        # The sheet now owns these values; do not retain a second full row index.
+        self.initial_rows = ()
+
+    def __call__(self, completed_rows):
+        if self._workbook is None:
+            self._open()
+        for row_idx, values in enumerate(islice(completed_rows, self._applied, None), self._applied + 2):
+            self._write_row(row_idx, values)
+        self._applied = len(completed_rows)
+        # openpyxl closes image streams while serializing; refresh them for each
+        # checkpoint so unrelated-sheet images survive reuse of this workbook.
+        for image, payload in self._image_payloads:
+            if isinstance(image.ref, BytesIO):
+                image.ref.close()
+            image.ref = BytesIO(payload)
+        save_workbook_atomic(self._workbook, self.path)
+
+    def close(self):
+        if self._workbook is not None:
+            try:
+                for sheet in self._workbook:
+                    for image in sheet._images:
+                        if isinstance(image.ref, BytesIO):
+                            image.ref.close()
+            finally:
+                self._workbook.close()
+                self._workbook = self._sheet = None
+                self._image_payloads = []
+
+
 def _save_to_mapping_sheet(df, workbook_path):
+    """Synchronous compatibility entry point with atomic workbook replacement."""
+    frozen_rows = tuple(df.itertuples(index=False, name=None))
+    writer = _MappingSheetWriter(workbook_path, tuple(df.columns), frozen_rows)
     try:
-        wb = load_workbook(workbook_path)
-    except FileNotFoundError:
-        wb = Workbook()
-        for name in wb.sheetnames:
-            if name in ('Sheet', 'Sheet1'):
-                del wb[name]
-    if 'mapping' in wb.sheetnames:
-        del wb['mapping']
-    ws = wb.create_sheet('mapping')
-    for col_idx, col_name in enumerate(df.columns, 1):
-        ws.cell(row=1, column=col_idx, value=col_name)
-    for row_idx, row in enumerate(df.itertuples(index=False, name=None), 2):
-        for col_idx, value in enumerate(row, 1):
-            ws.cell(row=row_idx, column=col_idx, value=value if not (isinstance(value, float) and value != value) else '')
-    wb.save(workbook_path)
+        writer(())
+    finally:
+        writer.close()
 
 def format_row_result(position: int, total: int, input_name: str, res: dict) -> str:
     mapped = str(res.get('output', '') or '')
@@ -2498,7 +3155,7 @@ def format_row_result(position: int, total: int, input_name: str, res: dict) -> 
     counter = f'[{position:>{len(str(total))}}/{total}]'
     return f"{counter} {input_name[:44]:<44} -> {tail}  ({res.get('status', '')})"
 
-def process_excel_file(workbook_path=None, master_path=None):
+def process_excel_file(workbook_path=None, master_path=None, *, autosave_interval=50):
     workbook_path = Path(workbook_path or INPUT_OUTPUT_XLSX_PATH)
     master = load_master_data(master_path)
     brand_map = build_brand_product_map(master)
@@ -2532,28 +3189,32 @@ def process_excel_file(workbook_path=None, master_path=None):
     output_columns = [OUTPUT_COLUMN, PRODUCT_CODE_COLUMN, STATUS_COLUMN, CONFIDENCE_COLUMN, CANDIDATES_COLUMN, SUGGESTIONS_COLUMN, SOURCE_COLUMN]
     for column in output_columns:
         rows[column] = pd.Series('', index=rows.index, dtype=object)
+    public_columns = tuple(column for column in rows if not column.startswith('_'))
+    writer = _MappingSheetWriter(
+        workbook_path, public_columns,
+        tuple(rows.loc[:, list(public_columns)].itertuples(index=False, name=None)),
+    )
     print(f'Processing {len(rows)} product rows locally...')
-    for idx, row in rows.iterrows():
-        value = row[INPUT_COLUMN]
-        input_name = '' if pd.isna(value) else str(value).strip()
-        hint_value = row.get('_brand_hint')
-        hint = None if pd.isna(hint_value) else str(hint_value).strip() or None
-        if not input_name:
-            result = make_result('SKIPPED_EMPTY_INPUT', status='SKIPPED_EMPTY', confidence='NONE')
-        else:
-            try:
-                result = process_product(input_name, brand_map, all_variants, all_sub_variants, forced_brand=hint, auto_detect=bool(row['_auto_detect']))
-            except Exception as exc:
-                result = make_result(f'ERROR: {str(exc)[:100]}', status='ERROR', confidence='NONE')
-        for column, key in ((OUTPUT_COLUMN, 'output'), (PRODUCT_CODE_COLUMN, 'product_code'), (STATUS_COLUMN, 'status'), (CONFIDENCE_COLUMN, 'confidence'), (CANDIDATES_COLUMN, 'candidate_count')):
-            rows.at[idx, column] = result[key]
-        rows.at[idx, SUGGESTIONS_COLUMN] = format_suggestions(result['suggestions'])
-        rows.at[idx, SOURCE_COLUMN] = row['_source_label']
-        print(format_row_result(idx + 1, len(rows), input_name, result))
-        if (idx + 1) % 50 == 0:
-            _save_to_mapping_sheet(rows.drop(columns=[c for c in rows if c.startswith('_')]), workbook_path)
+    with AsyncWorkbookSaver(writer, interval=autosave_interval, on_progress=print) as saver:
+        for idx, row in rows.iterrows():
+            value = row[INPUT_COLUMN]
+            input_name = '' if pd.isna(value) else str(value).strip()
+            hint_value = row.get('_brand_hint')
+            hint = None if pd.isna(hint_value) else str(hint_value).strip() or None
+            if not input_name:
+                result = make_result('SKIPPED_EMPTY_INPUT', status='SKIPPED_EMPTY', confidence='NONE')
+            else:
+                try:
+                    result = process_product(input_name, brand_map, all_variants, all_sub_variants, forced_brand=hint, auto_detect=bool(row['_auto_detect']))
+                except Exception as exc:
+                    result = make_result(f'ERROR: {str(exc)[:100]}', status='ERROR', confidence='NONE')
+            for column, key in ((OUTPUT_COLUMN, 'output'), (PRODUCT_CODE_COLUMN, 'product_code'), (STATUS_COLUMN, 'status'), (CONFIDENCE_COLUMN, 'confidence'), (CANDIDATES_COLUMN, 'candidate_count')):
+                rows.at[idx, column] = result[key]
+            rows.at[idx, SUGGESTIONS_COLUMN] = format_suggestions(result['suggestions'])
+            rows.at[idx, SOURCE_COLUMN] = row['_source_label']
+            print(format_row_result(idx + 1, len(rows), input_name, result))
+            saver.append(tuple(rows.at[idx, column] for column in public_columns))
     results = rows.drop(columns=[c for c in rows if c.startswith('_')])
-    _save_to_mapping_sheet(results, workbook_path)
     print(f'Saved {len(results)} rows to {workbook_path} -> mapping')
     return results
 
@@ -2601,6 +3262,20 @@ def _get_exact_catalog_index(brand_map: dict) -> dict:
 def load_master_data(path=None) -> pd.DataFrame:
     return load_master(path or MASTER_XLSX_PATH)
 _FORM_NAME_EQUIVALENTS = {'TABLET': 'TABLET', 'TABLETS': 'TABLET', 'TAB': 'TABLET', 'TABS': 'TABLET', 'TA': 'TABLET', 'CAPSULE': 'CAPSULE', 'CAPSULES': 'CAPSULE', 'CAP': 'CAPSULE', 'CAPS': 'CAPSULE', 'INJECTION': 'INJECTION', 'INJECTIONS': 'INJECTION', 'INJ': 'INJECTION', 'INJN': 'INJECTION', 'SYRUP': 'SYRUP', 'SYRUPS': 'SYRUP', 'SYP': 'SYRUP', 'SYR': 'SYRUP', 'SUSPENSION': 'SUSPENSION', 'SUSPENSIONS': 'SUSPENSION', 'SUSP': 'SUSPENSION', 'SUSPN': 'SUSPENSION', 'DROP': 'DROPS', 'DROPS': 'DROPS'}
+# Reuse existing aliases without changing OCR or complete-name identity indexes.
+_DOSAGE_FORM_ALIASES = {form: form for form, group in _FORM_GROUPS.items() if group in _EQUIVALENT_FORM_GROUPS}
+_DOSAGE_FORM_ALIASES.update(_FORM_NAME_EQUIVALENTS)
+_DOSAGE_FORM_ALIASES.update({alias.rstrip('.'): _FORM_NAME_EQUIVALENTS.get(form, form)
+                            for alias, form in INPUT_TOKEN_EQUIVALENTS.items()
+                            if _FORM_NAME_EQUIVALENTS.get(form, form) in _DOSAGE_FORM_ALIASES})
+_DOSAGE_FORM_ALIASES.update({'PFS': 'INJECTION', 'SOL': 'SOLUTION', 'SOLUTIONS': 'SOLUTION',
+                             'TONICS': 'TONIC', 'POW': 'POWDER', 'POWD': 'POWDER', 'POWDERS': 'POWDER',
+                             'GRANULE': 'GRANULES', 'SACHETS': 'SACHET', 'LIQUIDS': 'LIQUID', 'VIALS': 'VIAL'})
+_DOSAGE_FORM_ALIASES.update({alias: 'AMPULE' for alias in ('AMP', 'AMPS', 'AMPUL', 'AMPULE', 'AMPULES',
+                                                         'AMPOULE', 'AMPOULES', 'AMPOUL', 'AMPOULS', 'AMPOULEP', 'AMPOULP')})
+_DOSAGE_FORM_PATTERN = re.compile(r'(?<![A-Z])(?:' + '|'.join(re.escape(alias) for alias in sorted(_DOSAGE_FORM_ALIASES, key=len, reverse=True)) + r'|I\.?V\.?)(?![A-Z])', re.IGNORECASE)
+FORM_HINT_TOKENS.update(set(_DOSAGE_FORM_ALIASES) - {'CAPSULS'})
+GENERIC_VARIANT_MATCH_TOKENS.update(form for form, group in _FORM_GROUPS.items() if group in _EQUIVALENT_FORM_GROUPS)
 _FORM_CACHE_MAP = None
 _FORM_CACHE_INDEX = None
 
@@ -2626,7 +3301,10 @@ if __name__ == '__main__':
     parser.add_argument('--workbook', type=Path, default=INPUT_OUTPUT_XLSX_PATH)
     parser.add_argument('--product', help='Map one product locally')
     parser.add_argument('--interactive', action='store_true')
+    parser.add_argument('--autosave-every', type=int, default=50, metavar='ROWS', help='Background checkpoint interval; 0 saves only the final workbook (default: 50)')
     args = parser.parse_args()
+    if args.autosave_every < 0:
+        parser.error('--autosave-every must be zero or greater')
     if args.product is not None:
         catalog = build_brand_product_map(load_master_data(args.master))
         result = process_product(args.product, catalog, auto_detect=True)
@@ -2635,4 +3313,4 @@ if __name__ == '__main__':
     elif args.interactive:
         interactive_mode(args.master)
     else:
-        process_excel_file(args.workbook, args.master)
+        process_excel_file(args.workbook, args.master, autosave_interval=args.autosave_every)

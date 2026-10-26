@@ -9,6 +9,7 @@ import argparse
 import re
 
 from openpyxl import load_workbook
+from pro_diof import parse_description as parse_pro_diof_description
 
 BASE_DIR = Path(__file__).resolve().parent
 EXCEL_FILE = BASE_DIR / "test1.xlsx"
@@ -452,6 +453,29 @@ def build_brand_index(brands):
     return index
 
 
+def _fused_identity_pattern(brand_norm, variant, strength, product_name):
+    """Compile a complete, literal master identity for otherwise unresolved rows."""
+    if len(brand_norm) < 4 or not re.fullmatch(r"\d+(?:\.\d+)?", strength):
+        return None
+    dose = re.escape(strength)
+    units = set(re.findall(
+        rf"(?<![\d.]){dose}\s*(MCG|MG|GM|ML|IU|UNIT|G)\b",
+        str(product_name).upper(),
+    ))
+    if len(units) != 1:
+        return None
+    unit = re.escape(next(iter(units)))
+    brand = re.escape(brand_norm)
+    if variant:
+        identity = rf"{brand}{re.escape(variant)}\s+{dose}(?:\s*{unit})?"
+    else:
+        # A bare brand+number is insufficient: an attached dose needs its unit.
+        identity = rf"{brand}{dose}{unit}"
+    # Count packs carry no dose; a unit-bearing pack must repeat the same dose/unit.
+    pack = rf"(?:[1-9]\d*[X*][1-9]\d*|[1-9]\d*[X*]{dose}{unit})"
+    return re.compile(rf"{identity}(?:\s+{pack})?")
+
+
 def build_master_product_evidence(brand_index, master_file=None):
     """Return the master-backed evidence needed for conservative OCR recovery.
 
@@ -494,6 +518,12 @@ def build_master_product_evidence(brand_index, master_file=None):
                 "variant": "" if variant.upper() == "PLAIN" else variant_norm,
                 "strength": "" if sub_variant.upper() == "PLAIN" else sub_variant_norm,
                 "forms": master_form_groups(row[columns["product_name"]] or ""),
+                "fused_pattern": _fused_identity_pattern(
+                    brand_norm,
+                    "" if variant.upper() == "PLAIN" else variant_norm,
+                    sub_variant,
+                    row[columns["product_name"]] or "",
+                ),
             }
         )
 
@@ -525,13 +555,36 @@ def input_form_groups(value):
     return master_form_groups(value)
 
 
+def _fused_master_identity_match(name, master_evidence):
+    """Recover one complete master identity, never an arbitrary brand substring."""
+    text = str(name).strip().upper()
+    first_token = text.split(maxsplit=1)[0] if text else ""
+    matched_brand = None
+    for brand_norm, entry in master_evidence.items():
+        if not first_token.startswith(brand_norm) or len(first_token) <= len(brand_norm):
+            continue
+        for product in entry["products"]:
+            pattern = product.get("fused_pattern")
+            if pattern is not None and pattern.fullmatch(text):
+                if matched_brand is not None:
+                    return None
+                matched_brand = entry["brand"]
+    if matched_brand is None:
+        return None
+    return {
+        "brand": matched_brand,
+        "matched_text": first_token,
+        "match_type": "master-fused-identity",
+    }
+
+
 def master_product_match(name, master_evidence, precomputed_spans=None):
     """Return verified master evidence for fused variants or a narrow OCR typo.
 
     This path is deliberately available only after normal exact/fuzzy brand
-    matching fails.  It requires pharmaceutical form/quantity evidence, then
-    either an exact ``brand+variant`` token from the master or a non-prefix,
-    two-edit brand spelling with a master strength present in the row.
+    matching fails. Without a form/quantity signal, only a complete, unique
+    fused master identity is accepted. The existing form/quantity-backed
+    recovery paths otherwise retain their original behavior.
     """
     if not master_evidence:
         return None
@@ -539,7 +592,7 @@ def master_product_match(name, master_evidence, precomputed_spans=None):
     has_form = bool(MAYBE_PRODUCT_FORM_PATTERN.search(name))
     has_qty = bool(MAYBE_PRODUCT_QTY_PATTERN.search(name))
     if not (has_form or has_qty):
-        return None
+        return _fused_master_identity_match(name, master_evidence)
 
     spans = precomputed_spans if precomputed_spans is not None else token_spans(name)
     single_token_spans = [span for span in spans if len(span["tokens"]) == 1]
@@ -622,7 +675,7 @@ def master_product_match(name, master_evidence, precomputed_spans=None):
     # strength.  Excluding prefix/suffix truncations prevents a partial brand
     # from being promoted to a longer master brand.
     if not (has_form and has_qty):
-        return None
+        return _fused_master_identity_match(name, master_evidence)
     candidates = []
     for span in single_token_spans:
         for brand_norm, entry in master_evidence.items():
@@ -640,7 +693,7 @@ def master_product_match(name, master_evidence, precomputed_spans=None):
                 candidates.append((distance, -len(brand_norm), entry["brand"], span["text"]))
 
     if not candidates:
-        return None
+        return _fused_master_identity_match(name, master_evidence)
     candidates.sort()
     if len(candidates) > 1 and candidates[0][:2] == candidates[1][:2]:
         return None
@@ -866,10 +919,48 @@ def classify_single_product(name, brand_index, master_evidence, garbage_rows):
     match = exact_product_match(name, brand_index, precomputed_spans=spans)
     if match is None:
         match = fuzzy_product_match(name, brand_index, precomputed_spans=spans)
+    if match is None and 'CORLION' in name.upper():
+        from source_brand_aliases import resolve_source_brand_alias
+        alias = resolve_source_brand_alias(name, (brand for brand, normalized in brand_index))
+        if alias:
+            match = {'brand': alias, 'matched_text': 'CORLION', 'match_type': 'source-alias'}
+    if match is None and 'DIOF' in name.upper():
+        description = parse_pro_diof_description(name)
+        pro_brands = [brand for brand, normalized in brand_index if normalized == 'PRODIOF']
+        if description is not None and not description.error and len(pro_brands) == 1:
+            match = {'brand': pro_brands[0], 'matched_text': description.brand_text,
+                     'match_type': 'master-pro-diof-form'}
     if match is None:
-        match = master_product_match(name, master_evidence, precomputed_spans=spans)
+        # TA is an existing tablet alias in the mapper. Preserve exact/fuzzy
+        # precedence and use it only for otherwise unresolved FORTE evidence.
+        recovery_name = re.sub(r'\bTA\b', 'TABLET', name, flags=re.I) if re.search(r'\bFORTE\b', name, re.I) else name
+        match = master_product_match(recovery_name, master_evidence, precomputed_spans=spans)
     if match:
-        return ("0", match["brand"], match["matched_text"], match["match_type"], None, None)
+        # Brand-specific post-matching corrections.
+        if match["brand"] == "ESLO":
+            if "MET" in name.upper():
+                match["brand"] = "ESLOMET"
+        if match["brand"] == "DIOF":
+            if "PRO" in name.upper():
+                # DUCT blocks promotion (including PRODUCT), leaving no master hint.
+                match["brand"] = "PRO DIOF"
+                if "DUCT" not in name.upper():
+                    pro_brands = [brand for brand, normalized in brand_index
+                                  if normalized == "PRODIOF"]
+                    if len(pro_brands) == 1:
+                        match["brand"] = pro_brands[0]
+        if match["brand"] == "NEW":
+            if not re.search(r"\bNEW[\W_]*NORMET\b", name, re.IGNORECASE):
+                # Retry the normal flow without the rejected brand for this row.
+                return classify_single_product(
+                    name,
+                    [(brand, norm) for brand, norm in brand_index if brand != "NEW"],
+                    {norm: entry for norm, entry in (master_evidence or {}).items()
+                     if norm != "NEW"},
+                    garbage_rows,
+                )
+        if match:
+            return ("0", match["brand"], match["matched_text"], match["match_type"], None, None)
     if (is_exact_garbage_row(name, garbage_rows)
             or is_pattern_garbage_row(name)
             or is_metadata_garbage_row(name)):
