@@ -4,18 +4,24 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import shutil
 import sys
-import tempfile
 import time
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.cell import WriteOnlyCell
+from openpyxl.cell.cell import ERROR_CODES
+from openpyxl.utils import get_column_letter
+
+from excel_autosave import AsyncWorkbookSaver, save_workbook_atomic
 
 import garbage_check as gc
 import mapping as mp
+
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -76,7 +82,7 @@ def run_garbage_check_phase(product_names, brand_index, master_evidence, garbage
     return results
 
 
-def run_mapping_phase(gc_results, master_xlsx: Path, *, verbose=False):
+def run_mapping_phase(gc_results, master_xlsx: Path, *, verbose=False, on_row=None):
     """Map confirmed rows only; retain diagnostics separately from public output."""
     df = mp.load_master_data(str(master_xlsx))
     brand_map = mp.build_brand_product_map(df)
@@ -106,41 +112,62 @@ def run_mapping_phase(gc_results, master_xlsx: Path, *, verbose=False):
         if verbose:
             status = result.get("status", "") if result else classification
             print(f"[{index}/{len(gc_results)}] {name} -> {master_name} [{code}] ({status})")
+        if on_row is not None:
+            on_row(final_results[-1])
     return final_results, diagnostics
 
 
-def write_output_workbook(output_xlsx: Path, gc_results, final_results):
-    """Write the two output sheets atomically, including untrusted names as text."""
-    output_xlsx.parent.mkdir(parents=True, exist_ok=True)
-    wb = Workbook()
-    ws_gc = wb.active
-    ws_gc.title = "garbage_check"
-    ws_map = wb.create_sheet("mapping")
-    for ws, columns, rows in ((ws_gc, GC_COLS, gc_results), (ws_map, FINAL_COLS, final_results)):
-        ws.append(columns)
-        for row in rows:
-            ws.append([row.get(key, "") for key in columns])
-            for cell in ws[ws.max_row]:
-                if isinstance(cell.value, str):
-                    cell.data_type = "s"
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = ws.dimensions
-        ws.column_dimensions["A"].width = 55
-    ws_map.column_dimensions["B"].width = 18
-    ws_map.column_dimensions["C"].width = 65
-    tmp_path = None
+def write_output_workbook(output_xlsx: Path, gc_results, final_results, *, progress=None):
+    """Stream independent rows in linear time and atomically commit both sheets."""
+    wb = Workbook(write_only=True)
     try:
-        with tempfile.NamedTemporaryFile(suffix=".xlsx", prefix=".zuventus_", dir=output_xlsx.parent, delete=False) as handle:
-            tmp_path = Path(handle.name)
-        wb.save(tmp_path)
-        os.replace(tmp_path, output_xlsx)
+        for title, columns, rows in (("garbage_check", GC_COLS, gc_results), ("mapping", FINAL_COLS, final_results)):
+            ws = wb.create_sheet(title)
+            ws.freeze_panes = "A2"
+            ws.column_dimensions["A"].width = 55
+            if title == "mapping":
+                ws.column_dimensions["B"].width = 18
+                ws.column_dimensions["C"].width = 65
+            ws.append(columns)
+            count = 0
+            if progress:
+                progress(f"[output] Writing {title} worksheet...")
+            for count, row in enumerate(rows, start=1):
+                values = [row.get(key, "") for key in columns] if isinstance(row, dict) else row
+                cells = []
+                for value in values:
+                    # Ordinary scalars use openpyxl's reusable streaming cell.
+                    # Only formula/error-looking text needs an explicit literal
+                    # cell; wrapping every value adds an exception per cell in
+                    # openpyxl's streaming adapter.
+                    if isinstance(value, str) and (value.startswith("=") or value in ERROR_CODES):
+                        cell = WriteOnlyCell(ws, value=value)
+                        cell.data_type = "s"
+                        cells.append(cell)
+                    else:
+                        cells.append(value)
+                ws.append(cells)
+                if progress and count % 10000 == 0:
+                    progress(f"[output] {title}: {count} rows written")
+            ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{count + 1}"
+        if progress:
+            progress("[output] Saving Excel workbook...")
+        save_workbook_atomic(wb, output_xlsx)
     finally:
         wb.close()
-        if tmp_path is not None and tmp_path.exists():
-            tmp_path.unlink()
+        # openpyxl normally removes its streaming XML files after save. Also
+        # clean them after an interrupted/failed serialization, before retrying.
+        for ws in wb.worksheets:
+            if not ws.closed:
+                with suppress(Exception):
+                    ws.close()
+            writer = getattr(ws, "_writer", None)
+            if writer is not None and Path(writer.out).exists():
+                with suppress(OSError, ValueError):
+                    writer.cleanup()
 
 
-def run_pipeline(input_xlsx=INPUT_XLSX, master_xlsx=MASTER_XLSX, output_xlsx=None, *, backup=True, verbose=True):
+def run_pipeline(input_xlsx=INPUT_XLSX, master_xlsx=MASTER_XLSX, output_xlsx=None, *, backup=True, verbose=True, autosave_interval=1000):
     """Execute both local stages and return rows, diagnostics, counts, and paths."""
     input_path = Path(input_xlsx).expanduser().resolve()
     master_path = Path(master_xlsx).expanduser().resolve()
@@ -155,9 +182,22 @@ def run_pipeline(input_xlsx=INPUT_XLSX, master_xlsx=MASTER_XLSX, output_xlsx=Non
         print(f"Master: {master_path}")
     resources = build_garbage_check_resources(master_path)
     gc_results = run_garbage_check_phase(names, *resources)
-    final_results, diagnostics = run_mapping_phase(gc_results, master_path, verbose=verbose)
+    # Every checkpoint retains all source descriptions on the first sheet,
+    # including rows whose mapping has not yet been processed.
+    frozen_gc = tuple(tuple(row.get(column, "") for column in GC_COLS) for row in gc_results)
     backup_path = create_backup(output_path) if backup and output_path.exists() else None
-    write_output_workbook(output_path, gc_results, final_results)
+    progress = (lambda message: print(message, flush=True)) if verbose else None
+
+    def write_checkpoint(rows):
+        write_output_workbook(output_path, frozen_gc, rows, progress=progress)
+
+    with AsyncWorkbookSaver(write_checkpoint, interval=autosave_interval, on_progress=progress) as saver:
+        final_results, diagnostics = run_mapping_phase(
+            gc_results, master_path, verbose=verbose,
+            on_row=lambda row: saver.append(tuple(row[column] for column in FINAL_COLS)),
+        )
+        if progress:
+            progress("[output] Row processing complete; waiting for the final Excel checkpoint...")
     counts = {
         "total": len(final_results),
         "mapped": sum(row["PRODUCT_CODE"] not in {"0", "1"} for row in final_results),
@@ -180,9 +220,12 @@ def main(argv=None):
     parser.add_argument("--input", "-i", type=Path, default=INPUT_XLSX, help="Excel file containing PRODUCT_NAME (default: mapping.xlsx)")
     parser.add_argument("--master", type=Path, default=MASTER_XLSX, help="Zuventus Product Master")
     parser.add_argument("--output", "-o", type=Path, help="Separate result workbook (default: update input in place)")
+    parser.add_argument("--autosave-every", type=int, default=1000, help="Checkpoint interval in processed rows (0: final save only)")
     args = parser.parse_args(argv)
+    if args.autosave_every < 0:
+        parser.error("--autosave-every must be nonnegative")
     started = time.perf_counter()
-    run_pipeline(args.input, args.master, args.output)
+    run_pipeline(args.input, args.master, args.output, autosave_interval=args.autosave_every)
     print(f"Completed in {time.perf_counter() - started:.1f} seconds")
 
 

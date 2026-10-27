@@ -9,7 +9,8 @@ import argparse
 import re
 
 from openpyxl import load_workbook
-from pro_diof import parse_description as parse_pro_diof_description
+from pro_diof import (parse_description as parse_pro_diof_description,
+                      match_pro_brand, match_diof_brand)
 
 BASE_DIR = Path(__file__).resolve().parent
 EXCEL_FILE = BASE_DIR / "test1.xlsx"
@@ -930,6 +931,18 @@ def classify_single_product(name, brand_index, master_evidence, garbage_rows):
         if description is not None and not description.error and len(pro_brands) == 1:
             match = {'brand': pro_brands[0], 'matched_text': description.brand_text,
                      'match_type': 'master-pro-diof-form'}
+        elif not match_pro_brand(name):
+            diof = match_diof_brand(name)
+            brands = [brand for brand, normalized in brand_index if normalized == 'DIOF']
+            if diof and len(brands) == 1 and (master_evidence or {}).get('DIOF'):
+                match = {'brand': brands[0], 'matched_text': diof.group(),
+                         'match_type': 'master-diof-descriptor'}
+    if match is None and 'MAXTRA' in name.upper():
+        from maxtra import fused_brand_evidence
+        entry = (master_evidence or {}).get('MAXTRA')
+        if entry and fused_brand_evidence(name, entry['variants'], entry['products']):
+            match = {'brand': entry['brand'], 'matched_text': 'MAXTRA',
+                     'match_type': 'master-maxtra-descriptor'}
     if match is None:
         # TA is an existing tablet alias in the mapper. Preserve exact/fuzzy
         # precedence and use it only for otherwise unresolved FORTE evidence.
@@ -941,8 +954,9 @@ def classify_single_product(name, brand_index, master_evidence, garbage_rows):
             if "MET" in name.upper():
                 match["brand"] = "ESLOMET"
         if match["brand"] == "DIOF":
-            if "PRO" in name.upper():
-                # DUCT blocks promotion (including PRODUCT), leaving no master hint.
+            if match_pro_brand(name):
+                # Only a complete PRO component (or confirmed PEO source alias)
+                # establishes this family. PRODUCT/PROBIOTIC are not evidence.
                 match["brand"] = "PRO DIOF"
                 if "DUCT" not in name.upper():
                     pro_brands = [brand for brand, normalized in brand_index

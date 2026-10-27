@@ -20,6 +20,34 @@ UNIT_PATTERN = '|'.join(sorted(_UNITS, key=len, reverse=True))
 _PACK = re.compile(r'\s*(?:(\d+)\s*[X*]\s*)?(\d+(?:\.\d+)?|\.\d+)\s*(' + UNIT_PATTERN + r')\s*', re.I)
 _ENDING_UNIT = re.compile(r'(' + UNIT_PATTERN + r')\s*$', re.I)
 _FOLLOWING_UNIT = re.compile(r'\s*(' + UNIT_PATTERN + r')(?![A-Z])', re.I)
+_ML_PUNCTUATION = re.compile(r'(?<![\d.])(\d+)\s*[.;*\-]\s*ML\b', re.I)
+_SOURCE_VOLUME_UNIT = re.compile(
+    r'(?<![A-Z0-9.])((?:\d+\s*[X*×]\s*)?(?:\d+(?:\.\d+)?|\.\d+))\s*(?:MIL|NL|M)(?![A-Z0-9])', re.I)
+_SOURCE_BARE_VOLUME = re.compile(
+    r'(?<![A-Z0-9.*×])(?:(\d+)\s*[X*×]\s*)?(\d+)(?![A-Z0-9.])', re.I)
+
+
+def normalize_ml_punctuation(text, approved_volumes=None):
+    """Repair approved number/unit separators; callers establish liquid context."""
+    return _ML_PUNCTUATION.sub(lambda match: match[1] + ' ML'
+                              if approved_volumes is None or int(match[1]) in approved_volumes else match[0], text)
+
+
+def normalize_source_liquid_units(text, bare_volumes=(), *, single_container=False, approved_volumes=None):
+    """Bounded source notation, never an unscoped quantity-parser fallback."""
+    text = _SOURCE_VOLUME_UNIT.sub(
+        lambda match: match[1] + ' ML' if approved_volumes is None
+        or float(re.split(r'[X*×]', match[1])[-1]) in approved_volumes else match[0],
+        normalize_ml_punctuation(text, approved_volumes))
+
+    def bare(match):
+        if _FOLLOWING_UNIT.match(text, match.end()):
+            return match[0]
+        if match[1] is not None and not (single_container and match[1] == '1'):
+            return match[0]
+        return match[0] + ' ML' if int(match[2]) in bare_volumes else match[0]
+
+    return _SOURCE_BARE_VOLUME.sub(bare, text)
 
 
 def measurement(value, unit):
@@ -54,7 +82,7 @@ def matched_measurement(value, match, source, default_unit='COUNT'):
 
 
 def select_pack_rows(numbered, blank, requested):
-    """Exact, closest lower, then lowest; retain every tie for caller validation."""
+    """Exact, lower, unique blank base, then lowest; retain every numbered tie."""
     if not numbered:
         return (list(blank), '') if len(blank) == 1 else ([], 'AMBIGUOUS_PACK_TARGET' if blank else 'NO_COMPATIBLE_PACK')
     value, dimension = requested
@@ -73,5 +101,7 @@ def select_pack_rows(numbered, blank, requested):
     if exact:
         return exact, ''
     lower = [size for _, size in compatible if size < value]
+    if not lower and blank:
+        return (list(blank), '') if len(blank) == 1 else ([], 'AMBIGUOUS_PACK_TARGET')
     selected = max(lower) if lower else min(size for _, size in compatible)
     return [item for item, size in compatible if size == selected], ''

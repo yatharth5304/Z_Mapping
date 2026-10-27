@@ -11,9 +11,13 @@ from openpyxl import Workbook, load_workbook
 from rapidfuzz import fuzz, process
 from rapidfuzz.distance import Levenshtein, JaroWinkler
 from excel_autosave import AsyncWorkbookSaver, save_workbook_atomic
-from pro_diof import parse_description as parse_pro_diof_description, select_presentation as select_pro_diof_presentation
-from pack_selection import matched_measurement, measurement, parse_master_pack, select_pack_rows
+from pro_diof import (parse_description as parse_pro_diof_description,
+                      select_presentation as select_pro_diof_presentation,
+                      normalize_diof_source, match_pro_brand)
+from pack_selection import matched_measurement, measurement, parse_master_pack, select_pack_rows, UNIT_PATTERN
 from source_brand_aliases import resolve_source_brand_alias, replace_source_brand_alias
+from maxtra import (normalize_description as normalize_maxtra_description, tablet_count_evidence,
+                    normalize_liquid_quantity, recover_explicit_volume, NUMERIC_OFFER)
 MASTER_XLSX_PATH = Path(__file__).resolve().with_name('zuventus_product.xlsx')
 INPUT_OUTPUT_XLSX_PATH = Path(__file__).resolve().with_name('mapping.xlsx')
 ROW_LIMIT = None
@@ -54,12 +58,14 @@ _FORTE_DESCRIPTOR = re.compile(r'(?<![A-Z0-9])(?:' + _FORTE_ALIASES + ')' + _FOR
 _FORTE_HINT = re.compile(r'F(?:O|RO|RT|T)', re.I)
 _CTAX_FORTE_FORMS = re.compile(r'(?<![A-Z0-9])(?:D\s*/\s*(?:SYP|SYR(?:UP)?|S)?|DS|SUP|S)(?![A-Z0-9])', re.I)
 _CTAX_FORTE_SPLIT_SYRUP = re.compile(r'(?<![A-Z0-9])SY\s+P(?![A-Z0-9])', re.I)
-_CTAX_FORTE_34_6_METADATA = re.compile(r'(?<![A-Z0-9])\(\s*34\s*\+\s*6\s*\)(?![A-Z0-9])')
+_CTAX_FORTE_34_6_METADATA = re.compile(r'(?<![A-Z0-9])\(\s*34\s*\+\s*6\s*\)(?![A-Z0-9])', re.I)
 _CTAX_FIFTY = re.compile(r'(?<![A-Z0-9.])50(?:MLBOT|\s*M(?:\.L)?)(?![A-Z0-9.])', re.I)
 _CTAX_FIFTY_BARE = re.compile(r'(?<![A-Z0-9.])50(?![A-Z0-9.])(?!\s*(?:ML|MG|GM|MCG|G|L|KG|IU|UNIT)\b)', re.I)
 _DUPLICATE_50M = re.compile(r'(?<![A-Z0-9.])50M(?![A-Z0-9.])', re.IGNORECASE)
 _EXPLICIT_50ML = re.compile(r'(?<![A-Z0-9.])50\s*ML(?![A-Z0-9])', re.IGNORECASE)
 _PACK_MEASUREMENT = re.compile(r'(?<![A-Z0-9.])(\d+(?:\.\d+)?|\.\d+)\s*(MCG|MG|GM|ML|KG|G|L|IU|UNIT)\b', re.I)
+_EXPLICIT_PACK_SOURCE = re.compile(
+    r'(?<![A-Z0-9.])(?:\d+\s*[X*×]\s*)?(?:\d+(?:\.\d+)?|\.\d+)\s*(?:' + UNIT_PATTERN + r')(?![A-Z0-9])', re.I)
 
 def norm(s: str) -> str:
     s = str(s or '').upper().strip()
@@ -638,7 +644,7 @@ def get_compound_token_digits(compound_tokens: list) -> set:
 
 def get_all_pack_positions(input_upper: str) -> list:
     positions = []
-    for m in re.finditer('\\b(\\d+)\\s*[X*×]\\s*(\\d+(?:\\.\\d+)?)(?:\\s*(?:ML|GM|MG|MCG|IU|G|L|KG|TA|TABS?|TABLETS?|CAPS?|CAPSULES?|STRIPS?))?', input_upper):
+    for m in re.finditer('\\b(\\d+)\\s*[X*×]\\s*(\\d+(?:\\.\\d+)?)(?:\\s*(?:ML|GM|MG|MCG|IU|G|L|KG|TABLETS?|TABS?|TA|CAPSULES?|CAPS?|STRIPS?)(?![A-Z]))?', input_upper):
         positions.append((m.start(), m.end()))
     for m in re.finditer('\\bX\\s*(\\d+)\\b', input_upper):
         positions.append((m.start(), m.end()))
@@ -2276,8 +2282,39 @@ def _form_compatible(items: list, detected_forms: set, _catalog_form_recovery=Fa
             keep.append(item)
     return keep
 
-def _input_pack_measurement(input_name: str, items: list):
+def _pack_selection_input(input_name, items):
+    """Keep the lowest explicit compatible pack, without discarding strengths."""
+    matches = list(_EXPLICIT_PACK_SOURCE.finditer(input_name))
+    if len(matches) < 2 or len({(item.get('variant'), item.get('sub_variant')) for item in items}) != 1:
+        return input_name
+    dimensions = {pack[1] for item in items if (pack := parse_master_pack(item.get('pack_size', '')))}
+    count_dimensions = {dimension for dimension in dimensions if dimension.startswith('COUNT')}
+    quantities = []
+    for match in matches:
+        pack = parse_master_pack(match[0].replace('×', '*'))
+        if any(separator in match[0].upper() for separator in ('X', '*', '×')):
+            # Input multipliers retain the existing extraction interpretation;
+            # the master-pack parser must not substitute a stock aggregate.
+            pack = _extract_pack_size(match[0], with_measurement=True) or pack
+        if pack and pack[1] == 'COUNT' and len(count_dimensions) == 1:
+            pack = (pack[0], next(iter(count_dimensions)))
+        if pack and pack[1] in dimensions:
+            quantities.append((match, pack))
+    # Different dimensions cannot compete for the lowest pack.
+    if len(quantities) < 2 or len({pack[1] for _, pack in quantities}) != 1:
+        return input_name
+    lowest = min(pack[0] for _, pack in quantities)
+    for match, pack in reversed(quantities):
+        if pack[0] != lowest:
+            input_name = input_name[:match.start()] + ' ' * (match.end() - match.start()) + input_name[match.end():]
+    return input_name
+
+
+def _input_pack_measurement(input_name: str, items: list, *, _prefer_volume=False):
+    input_name = _pack_selection_input(input_name, items)
     requested = _extract_pack_size(input_name, with_measurement=True)
+    if _prefer_volume:
+        requested = recover_explicit_volume(input_name, requested)
     if requested and requested[1] != 'COUNT':
         dimensions = {pack[1] for item in items if (pack := parse_master_pack(item.get('pack_size', '')))}
         if dimensions and requested[1] not in dimensions:
@@ -2340,6 +2377,197 @@ def _explicit_variant_items_before_pack(items, input_name, brand):
     return explicit if explicit else items
 
 
+def _prepare_diof_candidates(text, items):
+    """Fence the ordinary family before retries can discard DS or descriptors."""
+    variants = {item['variant'] for item in items}
+    tokens = _input_variant_tokens_outside_packs(text, 'DIOF', variants)
+    known = _pack_form_skip_tokens() | {'DS', 'PLAIN', 'LIQUID', 'PACK', 'OF', 'X', 'L', 'G', 'KG'}
+    unknown = {word for token in tokens for word in re.findall('[A-Z]+', token)} - known
+    if unknown:
+        return [], 'VARIANT_NOT_IN_MASTER'
+    identity = 'DS' if 'DS' in tokens else 'PLAIN'
+    selected = [item for item in items if item['variant'] == identity]
+    forms = detect_dosage_form_in_input(text, verbose=False)
+    if forms:
+        selected = [item for item in selected
+                    if all(forms_share_group(detect_dosage_form_in_product(item['product']), {form}) for form in forms)]
+    if forms & {'SUSPENSION', 'SYRUP', 'SOLUTION'} and any(
+            measurement(*match.groups())[1] != 'VOLUME'
+            for match in _PACK_MEASUREMENT.finditer(text) if measurement(*match.groups())):
+        return [], 'NO_COMPATIBLE_PACK'
+    return (selected, '') if selected else ([], 'VARIANT_NOT_IN_MASTER')
+
+
+@lru_cache(maxsize=32)
+def _maxtra_identity_vocabulary(attributes):
+    return frozenset(token for value in attributes for token in extract_variant_match_tokens(value)) - {'PLAIN'}
+
+
+@lru_cache(maxsize=256)
+def _maxtra_variant_identity(value):
+    """Catalog identity is immutable; do not retokenize it for every source row."""
+    return _variant_identity_tokens(value)
+
+
+_MAXTRA_BRAND_CACHE = (None, None)
+
+
+def _prepare_maxtra_source(text, brand_map, forced_brand, auto_detect):
+    """Preserve approved source evidence before generic destructive cleaning."""
+    upper = text.upper()
+    if str(forced_brand or '').upper() != 'MAXTRA' and 'MAXTRA' not in upper and not upper.startswith('MAXT'):
+        return text
+    items = brand_map.get('MAXTRA', ())
+    if not items or forced_brand and str(forced_brand).upper() != 'MAXTRA':
+        return text
+    variants = tuple(sorted({item['variant'] for item in items}))
+    leading = re.match(r'^\s*([A-Z]+)(?=$|[\s-])', text, re.I)
+    if leading:
+        token = leading[1].upper()
+        # MAXTRAP is a supported glued identity, not a misspelled brand.
+        glued = token.startswith('MAXTRA') and token[6:] in _maxtra_identity_vocabulary(variants)
+        if token != 'MAXTRA' and token not in brand_map and not glued:
+            from garbage_check import edit_distance_leq_one, build_brand_index, exact_product_match, fuzzy_product_match
+            if edit_distance_leq_one(token, 'MAXTRA'):
+                confirmed = str(forced_brand or '').upper() == 'MAXTRA'
+                if not confirmed and auto_detect:
+                    global _MAXTRA_BRAND_CACHE
+                    cached_map, index = _MAXTRA_BRAND_CACHE
+                    if cached_map is not brand_map:
+                        index = build_brand_index(brand_map)
+                        _MAXTRA_BRAND_CACHE = (brand_map, index)
+                    match = exact_product_match(text, index) or fuzzy_product_match(text, index)
+                    confirmed = bool(match and match['brand'] == 'MAXTRA' and match['matched_text'].upper() == token)
+                if confirmed:
+                    text = text[:leading.start(1)] + 'MAXTRA' + text[leading.end(1):]
+    return normalize_maxtra_description(text, variants)
+
+
+def _prepare_maxtra_candidates(input_name, items):
+    """Establish approved MAXTRA identity/form before the normal filters run.
+
+    Return original master rows. Quantity interpretation and SKU selection stay
+    in the existing parser/universal selector; PS is an explicit family rule.
+    """
+    variants, subvariants, _ = extract_available_attributes_from_items(items)
+    text = input_name
+    if NUMERIC_OFFER.search(text):
+        return text, [], True, 'VARIANT_NOT_IN_MASTER'
+    if tablet_count_evidence(text):
+        text += ' TABLET'
+    tokens = _input_variant_tokens_outside_packs(text, 'MAXTRA', variants)
+    identity_vocab = _maxtra_identity_vocabulary(tuple(sorted(variants)))
+    identity = tokens & identity_vocab
+    forms = detect_dosage_form_in_input(text)
+    # Complete O/S SPRAY only when the loaded catalog has no other such family.
+    for token in ('O', 'S'):
+        if identity == {token} and re.search(r'\b' + token + r'[\s-]+SPRAY\b', text, re.I):
+            family = [item for item in items if token in _maxtra_variant_identity(item['variant'])]
+            if family and all(re.search(r'\bNASAL\s+SPRAY\b', item['product'], re.I) for item in family):
+                identity = identity | {'NASAL'}
+                text = re.sub(r'\b' + token + r'[\s-]+SPRAY\b', token + ' NASAL SPRAY', text, flags=re.I)
+    liquids = {'SYRUP', 'SUSPENSION', 'SOLUTION', 'LIQUID', 'DROPS', 'TONIC'}
+    liquid_identity = (identity in ({'GARGLE'}, {'P', 'DS'}, {'S', 'NASAL'}, {'S', 'NASAL', 'PS'}, {'O', 'NASAL'})
+                       or identity in ({'P'}, {'ORAL'}, {'P', 'ORAL'}, {'HS'}, {'HS', 'ORAL'}, {'C'}, {'N'}, {'DC'}, {'LM'})
+                       and bool(forms & liquids) and not forms - liquids
+                       or not identity and forms == {'DROPS'})
+    if liquid_identity:
+        family = [item for item in items if _maxtra_variant_identity(item['variant']) - {'PS'} == identity - {'PS'}]
+        sizes = {pack[0] for item in family if (pack := parse_master_pack(item.get('pack_size', ''))) and pack[1] == 'VOLUME'}
+        normalized = normalize_liquid_quantity(text, sizes, nasal_spray='NASAL' in identity and bool(re.search(r'\bSPRAY\b', text, re.I)))
+        if normalized != text:
+            text = normalized
+            # The generic 15 ML default must see the interpreted unit, not an
+            # obsolete M qualifier left over from the pre-normalization scan.
+            tokens = _input_variant_tokens_outside_packs(text, 'MAXTRA', variants)
+    requested = _input_pack_measurement(text, items, _prefer_volume=True)
+    if requested and requested[1] in {'MASS', 'ACTIVITY'} and not any(
+            (pack := parse_master_pack(item.get('pack_size', ''))) and pack[1] == requested[1] for item in items):
+        return text, [], True, 'NO_COMPATIBLE_PACK'
+    if requested is None and any(measurement(*match.groups()) for match in _PACK_MEASUREMENT.finditer(text.upper())):
+        # An unsupported physical measurement must not masquerade as a missing
+        # quantity and reach a blank-pack liquid/tablet default.
+        return text, [], True, 'NO_COMPATIBLE_PACK'
+    # Preserve the old bare-brand path when no descriptor or form is supplied.
+    if not (tokens - {'PLAIN'} or forms):
+        return text, items, False, ''
+    if identity == {'S'} and requested == (20, 'VOLUME'):
+        s_items = [item for item in items if 'S' in _maxtra_variant_identity(item['variant'])]
+        s_identities = {_maxtra_variant_identity(item['variant']) - {'PS'} for item in s_items}
+        s_twenty = [item for item in s_items if parse_master_pack(item.get('pack_size', '')) == (20, 'VOLUME')]
+        # The approved omission is limited to the unique S 20 ML presentation.
+        # Do not infer a nasal identity when the catalog has another S family.
+        if (len(s_twenty) == 1 and _maxtra_variant_identity(s_twenty[0]['variant']) == {'S', 'NASAL', 'PS'}
+                and s_identities == {frozenset({'S', 'NASAL'})} and all(
+                re.search(r'\bNASAL\s+SPRAY\b', item['product'], re.I) for item in s_items)):
+            identity = identity | {'NASAL'}
+            text += ' NASAL SPRAY'
+    inferred_ps = False
+    if ({'S', 'NASAL'} <= identity and not identity & {'O', 'P', 'HS', 'N', 'ORAL'}
+            or identity == {'O', 'NASAL'}):
+        # Approved O/S NASAL drops terminology stays in its own spray family.
+        text = re.sub(r'\b(?:DROPS?|DR)\b', 'SPRAY', text, flags=re.I)
+        if 'S' in identity and requested == (20, 'VOLUME') and 'PS' not in identity:
+            identity = identity | {'PS'}
+            text += ' PS'
+            inferred_ps = True
+        forms = detect_dosage_form_in_input(text)
+    elif (identity == {'HS'} and forms & {'DROPS', 'SYRUP', 'SUSPENSION', 'LIQUID', 'SOLUTION', 'TONIC'}
+          and {variant for variant in variants if 'HS' in _maxtra_variant_identity(variant)} == {'HS ORAL'}):
+        identity = identity | {'ORAL'}
+        text += ' ORAL'
+    elif (not identity and 'DROPS' in forms and requested == (15, 'VOLUME')
+          and not (tokens - _pack_form_skip_tokens() - {'PLAIN'})):
+        identity = {'ORAL'}
+        text += ' ORAL'
+
+    # Unlike the legacy fail-open compound filter, a printed family token may
+    # not disappear into a different family during a low-confidence retry.
+    selected = [item for item in items
+                if _maxtra_variant_identity(item['variant']) == identity]
+    if inferred_ps and not any(parse_master_pack(item.get('pack_size', '')) == (20, 'VOLUME') for item in selected):
+        return text, [], True, 'MISSING_MAXTRA_TARGET'
+    sub_identity = tokens & _maxtra_identity_vocabulary(tuple(sorted(subvariants)))
+    selected = [item for item in selected
+                if _maxtra_variant_identity(str(item['sub_variant'])) == sub_identity]
+    upper = normalize_ocr_numeric_noise(text)
+    if re.search(r'\bGARGLE\b', upper):
+        selected = [item for item in selected if re.search(r'\bGARGLE\b', item['product'], re.I)]
+        if forms - {'SYRUP', 'SUSPENSION', 'LIQUID', 'SOLUTION'}:
+            selected = []
+    elif re.search(r'\bNASAL\s+SPRAY\b', upper):
+        selected = [item for item in selected if re.search(r'\bNASAL\s+SPRAY\b', item['product'], re.I)]
+        if forms:
+            selected = []  # A second, incompatible printed form is not erased.
+    elif forms:
+        # Keep the existing syrup/liquid and solid-oral aliases. Explicit drops
+        # remain distinct here: P syrup must not win over a missing P drops row.
+        non_drop_liquids = {'SYRUP', 'SUSPENSION', 'LIQUID', 'SOLUTION', 'TONIC'}
+
+        def compatible(product):
+            product_forms = detect_dosage_form_in_product(product)
+            return all(bool(product_forms & non_drop_liquids) if form in non_drop_liquids
+                       else bool(product_forms & {'TABLET', 'CAPSULE'}) if form in {'TABLET', 'CAPSULE'}
+                       else form in product_forms for form in forms)
+
+        family_items = selected
+        selected = [item for item in family_items if compatible(item['product'])]
+        if not selected and 'ORAL' in identity:
+            # Confirmed ORAL/HS identity retains the existing liquid-form
+            # equivalence when its catalog offers only the drops presentation.
+            selected = [item for item in family_items
+                        if all(forms_share_group(detect_dosage_form_in_product(item['product']), {form}) for form in forms)]
+    # Scan beyond the first form as well: later unknown/conflicting descriptors
+    # cannot be dropped by the older qualifier retry.
+    printed = _input_variant_tokens_outside_packs(text, 'MAXTRA', variants)
+    known = _pack_form_skip_tokens() | {'PLAIN', 'SPRAY', 'NASAL', 'ORAL', 'GARGLE', 'LIQUID', 'BOTTLE', 'BOTTLES', 'PACK', 'OF', 'X', 'UNIT', 'UNITS', 'L', 'G', 'KG'}
+    known |= identity_vocab | _maxtra_identity_vocabulary(tuple(sorted(subvariants)))
+    unknown = {word for token in printed for word in re.findall('[A-Z]+', token)} - known
+    if unknown or not selected:
+        return text, [], True, 'VARIANT_NOT_IN_MASTER'
+    return text, selected, True, ''
+
+
 def filter_items_by_pack_size(items: list, input_pack_size: str, reference_items: list=None, verbose=False,
                               _keep_form_ties=False, _measurement=None, _legacy=False) -> list:
     if _legacy or not input_pack_size:
@@ -2366,7 +2594,7 @@ def filter_items_by_pack_size(items: list, input_pack_size: str, reference_items
     identities = {(str(item.get('variant', 'PLAIN')).upper(), str(item.get('sub_variant', 'PLAIN')).upper()) for item in items}
     if len(identities) != 1:
         return []
-    if not numbered and blank:
+    if blank:
         form_groups = {
             'VOLUME': {_FORM_GROUPS['SYRUP'], _FORM_GROUPS['INJECTION']},
             'COUNT_ORAL': {_FORM_GROUPS['TABLET']},
@@ -2378,7 +2606,7 @@ def filter_items_by_pack_size(items: list, input_pack_size: str, reference_items
                      or groups & form_groups]
     selected, refusal = select_pack_rows(numbered, blank, requested)
     if verbose:
-        print(f'  [PACK] Exact / lower / lowest: {len(items)} -> {len(selected)} ({refusal or requested})')
+        print(f'  [PACK] Exact / lower / base / lowest: {len(items)} -> {len(selected)} ({refusal or requested})')
     return selected
 
 
@@ -2748,6 +2976,16 @@ def _process_product_core(input_name: str, brand_map: dict, all_variants: set=No
         return make_result(item['product'], item.get('product_code', ''), status='MATCHED', confidence='HIGH', candidate_count=1, suggestions=[{'product': item['product'], 'product_code': item.get('product_code', ''), 'score': 100.0}])
     if len(form_items) > 1:
         return make_result('NO_CLEAR_MATCH', '', status='AMBIGUOUS_FORM_NAME', confidence='NONE', candidate_count=len(form_items), suggestions=[{'product': item['product'], 'product_code': item.get('product_code', ''), 'score': 100.0} for item in form_items[:TOP_N_SUGGESTIONS]])
+    diof_source = None
+    if 'DIOF' in input_name.upper() and (not forced_brand or compact_brand_token(forced_brand) == 'DIOF'):
+        leading = re.match(r'[A-Z0-9]+', input_name.upper())
+        literal_other_brand = (not forced_brand and leading and leading[0] in brand_map
+                               and compact_brand_token(leading[0]) != 'DIOF')
+        diof_source = None if literal_other_brand else normalize_diof_source(
+            input_name, confirmed=bool(forced_brand) or auto_detect)
+        if diof_source is not None:
+            input_name = diof_source
+    input_name = _prepare_maxtra_source(input_name, brand_map, forced_brand, auto_detect)
     input_name = clean_duplicate_words(input_name)
     forced_brand_variant_tags = get_brand_variant_tags(brand_map, forced_brand) if forced_brand else None
     input_name = strip_parenthetical_noise(input_name, forced_brand_variant_tags)
@@ -2802,6 +3040,22 @@ def _process_product_core(input_name: str, brand_map: dict, all_variants: set=No
         if verbose:
             print(f'\nNO_CLEAR_MATCH: no brand within {NO_BRAND_RECOVERY_MAX_EDITS} edits (nearest gap {dist})')
         return make_result('NO_CLEAR_MATCH', '', status='NO_BRAND', confidence='NONE', candidate_count=0, suggestions=suggestions)
+    maxtra_input = False
+    diof_input = compact_brand_token(brand) == 'DIOF'
+    if diof_input:
+        if match_pro_brand(input_name):
+            return make_result('NO_CLEAR_MATCH', status='CONFLICTING_BRAND', confidence='NONE')
+        prepared = diof_source or normalize_diof_source(input_name, confirmed=True)
+        if prepared is None:
+            return make_result('NO_CLEAR_MATCH', status='NO_BRAND', confidence='NONE')
+        input_name = desegment_ocr_input(prepared, brand_map)
+        items, refusal = _prepare_diof_candidates(input_name, items)
+        if refusal:
+            return make_result('NO_CLEAR_MATCH', status=refusal, confidence='NONE')
+    if brand == 'MAXTRA':
+        input_name, items, maxtra_input, refusal = _prepare_maxtra_candidates(input_name, items)
+        if refusal:
+            return make_result('NO_CLEAR_MATCH', '', status=refusal, confidence='NONE')
     forte_input = False
     if _FORTE_HINT.search(input_name) and compact_brand_token(brand) != 'PRODIOF':
         input_name, items, forte_input, refusal = _prepare_forte_candidates(input_name, brand, items)
@@ -2901,7 +3155,7 @@ def _process_product_core(input_name: str, brand_map: dict, all_variants: set=No
         if forte_input:
             identities = {(item['variant'], item['sub_variant']) for item in brand_scope_items}
             forte_retry_safe = len(identities) == 1 and not forte_conflicts
-        if not _lower_variant_retry and (not forte_input or forte_retry_safe) and (not numeric_orphan):
+        if not maxtra_input and not _lower_variant_retry and (not forte_input or forte_retry_safe) and (not numeric_orphan):
             stripped = input_name
             for o in orphan_quals:
                 stripped = re.sub('\\b' + re.escape(o) + '\\b', ' ', stripped)
@@ -2948,15 +3202,16 @@ def _process_product_core(input_name: str, brand_map: dict, all_variants: set=No
             if _retry:
                 items = _retry
     _before_ns = items
-    items = filter_items_by_name_strength(items, input_name, verbose=verbose)
+    pack_input = _pack_selection_input(input_name, items) if compact_brand_token(brand) != 'PRODIOF' else input_name
+    items = filter_items_by_name_strength(items, pack_input, verbose=verbose)
     if _input_forms and items and (not _form_compatible(items, _input_forms, _catalog_form_recovery)):
         _pool = _form_compatible(_before_ns, _input_forms, _catalog_form_recovery)
         if _pool:
-            _retry = filter_items_by_name_strength(_pool, input_name, verbose=verbose)
+            _retry = filter_items_by_name_strength(_pool, pack_input, verbose=verbose)
             if _retry:
                 items = _retry
     legacy_pack = compact_brand_token(brand) == 'PRODIOF'
-    requested_pack = None if legacy_pack else _input_pack_measurement(input_name, items)
+    requested_pack = None if legacy_pack else _input_pack_measurement(pack_input, items, _prefer_volume=brand == 'MAXTRA')
     input_pack_size = extract_pack_size_from_input(input_name) if legacy_pack else str(requested_pack[0]) if requested_pack else ''
     if requested_pack:
         sources = _pack_source_brands(brand_map)
@@ -2974,6 +3229,16 @@ def _process_product_core(input_name: str, brand_map: dict, all_variants: set=No
                                       _measurement=requested_pack, _legacy=legacy_pack)
     if requested_pack and not items:
         return make_result('NO_CLEAR_MATCH', '', status='NO_COMPATIBLE_PACK', confidence='NONE', candidate_count=0)
+    if maxtra_input:
+        valid = [item for item in items if str(item.get('product_code', '')).strip() not in {'', '0', '1', 'nan', 'None'}]
+        if len(items) != 1 or len(valid) != 1:
+            return make_result('NO_CLEAR_MATCH', '', status='AMBIGUOUS_MAXTRA_TARGET' if len(items) > 1 else 'MISSING_MAXTRA_TARGET',
+                               confidence='NONE', candidate_count=len(items), suggestions=build_item_suggestions(items, input_name))
+    if diof_input:
+        valid = [item for item in items if str(item.get('product_code', '')).strip() not in {'', '0', '1', 'nan', 'None'}]
+        if len(items) != 1 or len(valid) != 1:
+            return make_result('NO_CLEAR_MATCH', status='AMBIGUOUS_DIOF_TARGET' if len(items) > 1 else 'MISSING_DIOF_TARGET',
+                               confidence='NONE', candidate_count=len(items), suggestions=build_item_suggestions(items, input_name))
     if forte_input:
         valid = [item for item in items if str(item.get('product_code', '')).strip() not in {'', '0', '1', 'nan', 'None'}]
         if len(valid) != 1 or len(items) != 1:
