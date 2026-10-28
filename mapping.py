@@ -18,6 +18,7 @@ from pack_selection import matched_measurement, measurement, parse_master_pack, 
 from source_brand_aliases import resolve_source_brand_alias, replace_source_brand_alias
 from maxtra import (normalize_description as normalize_maxtra_description, tablet_count_evidence,
                     normalize_liquid_quantity, recover_explicit_volume, NUMERIC_OFFER)
+from soventus import prepare_candidates as prepare_soventus_candidates, preserve_tags as preserve_soventus_tags
 MASTER_XLSX_PATH = Path(__file__).resolve().with_name('zuventus_product.xlsx')
 INPUT_OUTPUT_XLSX_PATH = Path(__file__).resolve().with_name('mapping.xlsx')
 ROW_LIMIT = None
@@ -2412,6 +2413,41 @@ def _maxtra_variant_identity(value):
 _MAXTRA_BRAND_CACHE = (None, None)
 
 
+_SOVENTUS_BRAND_CACHE = (None, None)
+
+
+def _prepare_soventus_source(text, brand_map, forced_brand, auto_detect):
+    """Reuse classifier evidence before direct-call cleanup can lose identity."""
+    hint = str(forced_brand or '').strip().upper()
+    if hint and hint != 'SOVENTUS' or not hint and not auto_detect:
+        return text
+    upper = text.upper()
+    if not brand_map.get('SOVENTUS') or hint != 'SOVENTUS' and 'SOV' not in upper and not upper.lstrip().startswith('OVENTUS'):
+        return text
+    leading = re.match(r'^\s*([A-Z]+)', text, re.I)
+    if not leading:
+        return text
+    token = leading[1].upper()
+    if token in brand_map and token != 'SOVENTUS':
+        return text
+    if token != 'SOVENTUS' and not token.startswith('SOVENTUS'):
+        from garbage_check import build_brand_index, exact_product_match, fuzzy_product_match
+        global _SOVENTUS_BRAND_CACHE
+        cached_map, index = _SOVENTUS_BRAND_CACHE
+        if cached_map is not brand_map:
+            index = build_brand_index(brand_map)
+            _SOVENTUS_BRAND_CACHE = (brand_map, index)
+        matched = exact_product_match(text, index) or fuzzy_product_match(text, index)
+        if not matched or matched['brand'] != 'SOVENTUS' or matched['matched_text'].upper() != token:
+            # Reuse the direct mapper's existing OCR recovery for truncated
+            # leading spellings; do not introduce another edit threshold.
+            recovered_brand, _ = find_best_brand_for_input(text, brand_map, verbose=False)
+            if not token.startswith('SOV') or recovered_brand != 'SOVENTUS':
+                return text
+        text = text[:leading.start(1)] + 'SOVENTUS' + text[leading.end(1):]
+    return preserve_soventus_tags(text)
+
+
 def _prepare_maxtra_source(text, brand_map, forced_brand, auto_detect):
     """Preserve approved source evidence before generic destructive cleaning."""
     upper = text.upper()
@@ -2986,6 +3022,7 @@ def _process_product_core(input_name: str, brand_map: dict, all_variants: set=No
         if diof_source is not None:
             input_name = diof_source
     input_name = _prepare_maxtra_source(input_name, brand_map, forced_brand, auto_detect)
+    input_name = _prepare_soventus_source(input_name, brand_map, forced_brand, auto_detect)
     input_name = clean_duplicate_words(input_name)
     forced_brand_variant_tags = get_brand_variant_tags(brand_map, forced_brand) if forced_brand else None
     input_name = strip_parenthetical_noise(input_name, forced_brand_variant_tags)
@@ -3056,6 +3093,15 @@ def _process_product_core(input_name: str, brand_map: dict, all_variants: set=No
         input_name, items, maxtra_input, refusal = _prepare_maxtra_candidates(input_name, items)
         if refusal:
             return make_result('NO_CLEAR_MATCH', '', status=refusal, confidence='NONE')
+    soventus_input = brand == 'SOVENTUS'
+    if soventus_input:
+        input_name, items, refusal = prepare_soventus_candidates(input_name, items)
+        if refusal:
+            return make_result('NO_CLEAR_MATCH', status=refusal, confidence='NONE')
+        soventus_scope = tuple(items)
+        physical = [measurement(*match.groups()) for match in _PACK_MEASUREMENT.finditer(input_name)]
+        if any(value and value[1] in {'MASS', 'ACTIVITY'} for value in physical):
+            return make_result('NO_CLEAR_MATCH', status='NO_COMPATIBLE_PACK', confidence='NONE')
     forte_input = False
     if _FORTE_HINT.search(input_name) and compact_brand_token(brand) != 'PRODIOF':
         input_name, items, forte_input, refusal = _prepare_forte_candidates(input_name, brand, items)
@@ -3164,9 +3210,9 @@ def _process_product_core(input_name: str, brand_map: dict, all_variants: set=No
                                                   _exclude_inferred_forte=_exclude_inferred_forte)
             if stripped and stripped != input_name and any((v != 'PLAIN' for v in lower_vars)):
                 res = _process_product_core(stripped, brand_map, all_variants, all_sub_variants, client, verbose=verbose, _lower_variant_retry=True, forced_brand=forced_brand, auto_detect=auto_detect, _catalog_form_recovery=_catalog_form_recovery, _exclude_inferred_forte=_exclude_inferred_forte)
-                if forte_input and res.get('product_code') and not any(
+                if (forte_input or soventus_input) and res.get('product_code') and not any(
                         item['product_code'] == res['product_code'] and item['product'] == res['output']
-                        for item in brand_scope_items):
+                         for item in (soventus_scope if soventus_input else brand_scope_items)):
                     return make_result('NO_CLEAR_MATCH', '', status='VARIANT_NOT_IN_MASTER', confidence='NONE')
                 if res['status'] == 'MATCHED' and res['output'] != 'NO_CLEAR_MATCH':
                     if verbose:
@@ -3211,7 +3257,7 @@ def _process_product_core(input_name: str, brand_map: dict, all_variants: set=No
             if _retry:
                 items = _retry
     legacy_pack = compact_brand_token(brand) == 'PRODIOF'
-    requested_pack = None if legacy_pack else _input_pack_measurement(pack_input, items, _prefer_volume=brand == 'MAXTRA')
+    requested_pack = None if legacy_pack else _input_pack_measurement(pack_input, items, _prefer_volume=brand in {'MAXTRA', 'SOVENTUS'})
     input_pack_size = extract_pack_size_from_input(input_name) if legacy_pack else str(requested_pack[0]) if requested_pack else ''
     if requested_pack:
         sources = _pack_source_brands(brand_map)
@@ -3238,6 +3284,11 @@ def _process_product_core(input_name: str, brand_map: dict, all_variants: set=No
         valid = [item for item in items if str(item.get('product_code', '')).strip() not in {'', '0', '1', 'nan', 'None'}]
         if len(items) != 1 or len(valid) != 1:
             return make_result('NO_CLEAR_MATCH', status='AMBIGUOUS_DIOF_TARGET' if len(items) > 1 else 'MISSING_DIOF_TARGET',
+                               confidence='NONE', candidate_count=len(items), suggestions=build_item_suggestions(items, input_name))
+    if soventus_input:
+        valid = [item for item in items if str(item.get('product_code', '')).strip() not in {'', '0', '1', 'nan', 'None'}]
+        if len(items) != 1 or len(valid) != 1:
+            return make_result('NO_CLEAR_MATCH', status='AMBIGUOUS_SOVENTUS_TARGET' if len(items) > 1 else 'MISSING_SOVENTUS_TARGET',
                                confidence='NONE', candidate_count=len(items), suggestions=build_item_suggestions(items, input_name))
     if forte_input:
         valid = [item for item in items if str(item.get('product_code', '')).strip() not in {'', '0', '1', 'nan', 'None'}]
