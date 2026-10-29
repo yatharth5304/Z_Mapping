@@ -2416,6 +2416,39 @@ _MAXTRA_BRAND_CACHE = (None, None)
 _SOVENTUS_BRAND_CACHE = (None, None)
 
 
+_JUNIOR_SOURCE_ALIASES = re.compile(r'(?<![A-Z0-9])(?:JUNIOR|JNR|JUN|JR|JN|JU|JUR|J)(?![A-Z0-9])', re.I)
+_JUNIOR_SOURCE_BRAND = re.compile(r'^\s*(FLORIMAX|ZOSA)(?![A-Z0-9])', re.I)
+
+
+def _prepare_junior_source(text, brand_map, forced_brand, auto_detect):
+    """Resolve approved Junior aliases to this brand's actual catalog variant."""
+    brand = str(forced_brand or '').strip().upper()
+    if not brand and auto_detect:
+        leading = _JUNIOR_SOURCE_BRAND.match(text)
+        brand = leading[1].upper() if leading else ''
+    if brand not in {'FLORIMAX', 'ZOSA'} or not _JUNIOR_SOURCE_ALIASES.search(text):
+        return text
+    items = brand_map.get(brand, ())
+    variants = {str(item.get('variant', '')).strip().upper() for item in items}
+    targets = variants & {'JR', 'JUNIOR'}
+    if len(targets) != 1:
+        return text  # No unique canonical identity; do not merge distinct variants.
+    target = next(iter(targets))
+    vocabulary = _variant_vocabulary(tuple(sorted(variants | {
+        str(item.get('sub_variant', '')).strip().upper() for item in items})))
+    # This approval adds aliases, not permission for the qualifier retry to
+    # discard other words once a previously unknown Junior token is resolved.
+    descriptor = _JUNIOR_SOURCE_ALIASES.sub(' ', normalize_ocr_numeric_noise(text))
+    tokens = _input_variant_tokens_outside_packs(descriptor, brand, variants)
+    known = vocabulary | _pack_form_skip_tokens() | {'G', 'L', 'KG', 'PACK', 'OF', 'COUNT', 'UNITS'}
+    if {word for token in tokens for word in re.findall(r'[A-Z]+', token)} - known:
+        return text
+    text = _JUNIOR_SOURCE_ALIASES.sub(
+        lambda match: match[0] if match[0].upper() in vocabulary else target, text)
+    # Normalize before generic cleanup can discard short parenthesized aliases.
+    return re.sub(r'\(\s*' + re.escape(target) + r'\s*\)', ' ' + target + ' ', text, flags=re.I)
+
+
 def _prepare_soventus_source(text, brand_map, forced_brand, auto_detect):
     """Reuse classifier evidence before direct-call cleanup can lose identity."""
     hint = str(forced_brand or '').strip().upper()
@@ -3023,6 +3056,7 @@ def _process_product_core(input_name: str, brand_map: dict, all_variants: set=No
             input_name = diof_source
     input_name = _prepare_maxtra_source(input_name, brand_map, forced_brand, auto_detect)
     input_name = _prepare_soventus_source(input_name, brand_map, forced_brand, auto_detect)
+    input_name = _prepare_junior_source(input_name, brand_map, forced_brand, auto_detect)
     input_name = clean_duplicate_words(input_name)
     forced_brand_variant_tags = get_brand_variant_tags(brand_map, forced_brand) if forced_brand else None
     input_name = strip_parenthetical_noise(input_name, forced_brand_variant_tags)
@@ -3270,6 +3304,18 @@ def _process_product_core(input_name: str, brand_map: dict, all_variants: set=No
             if len(identities) > 1:
                 return make_result('NO_CLEAR_MATCH', '', status='AMBIGUOUS_PACK_IDENTITY', confidence='NONE',
                                    candidate_count=len(items), suggestions=build_item_suggestions(items, input_name))
+    # Approved SOVENTUS LS syrup exception; keep the general pack policy intact.
+    # Require a 100 ML presentation, not merely an aggregate such as 2X50 ML.
+    if (soventus_input and detected_variants == {'LS'} and _input_forms == {'SYRUP'}
+            and requested_pack == (100.0, 'VOLUME')):
+        explicit_100ml = any(
+            parse_master_pack(re.split(r'[X*×]', match[0], flags=re.I)[-1]) == (100.0, 'VOLUME')
+            for match in _EXPLICIT_PACK_SOURCE.finditer(pack_input))
+        bases = [item for item in items
+                 if not str(item.get('pack_size', '')).strip()
+                 and norm(item['product']) == norm('SOVENTUS LS SYRUP')] if explicit_100ml else []
+        if bases:
+            items = bases  # Existing selectors/validators still reject duplicate or invalid targets.
     items = filter_items_by_pack_size(items, input_pack_size, reference_items=brand_scope_items, verbose=verbose,
                                       _keep_form_ties=bool(_form_precedence(input_name)),
                                       _measurement=requested_pack, _legacy=legacy_pack)
