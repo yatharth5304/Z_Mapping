@@ -916,6 +916,9 @@ def classify_single_product(name, brand_index, master_evidence, garbage_rows):
     unresolved row remains MAYBE_PRODUCT; no inferred product is promoted to 0.
     """
     name = "" if name is None else str(name).strip()
+    if 'ENZYME' in name.upper():
+        from source_brand_aliases import normalize_hu_enzyme_source
+        name = normalize_hu_enzyme_source(name, (brand for brand, _ in brand_index))
     spans = token_spans(name)
     match = exact_product_match(name, brand_index, precomputed_spans=spans)
     if match is None:

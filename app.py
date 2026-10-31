@@ -25,7 +25,7 @@ import mapping as mp
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
-INPUT_XLSX = Path(os.environ.get("MAPPING_INPUT_XLSX", PROJECT_DIR / "mapping.xlsx"))
+INPUT_XLSX = Path(os.environ.get("MAPPING_INPUT_XLSX", PROJECT_DIR / "mapping (2).xlsx"))
 MASTER_XLSX = Path(os.environ.get("MASTER_XLSX", PROJECT_DIR / "zuventus_product.xlsx"))
 GC_COLS = [
     "PRODUCT_NAME", "Garbage check", "Matched brand", "Matched text",

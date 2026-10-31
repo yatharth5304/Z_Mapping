@@ -15,7 +15,8 @@ from pro_diof import (parse_description as parse_pro_diof_description,
                       select_presentation as select_pro_diof_presentation,
                       normalize_diof_source, match_pro_brand)
 from pack_selection import matched_measurement, measurement, parse_master_pack, select_pack_rows, UNIT_PATTERN
-from source_brand_aliases import resolve_source_brand_alias, replace_source_brand_alias
+from source_brand_aliases import (resolve_source_brand_alias, replace_source_brand_alias,
+                                  normalize_hu_enzyme_source)
 from maxtra import (normalize_description as normalize_maxtra_description, tablet_count_evidence,
                     normalize_liquid_quantity, recover_explicit_volume, NUMERIC_OFFER)
 from soventus import prepare_candidates as prepare_soventus_candidates, preserve_tags as preserve_soventus_tags
@@ -2922,6 +2923,115 @@ def filter_items_by_name_strength(items: list, input_name: str, verbose=False) -
         return matched
     return items
 
+
+def _prepare_docezap_candidates(input_name: str, items: list):
+    """Keep the approved solvent/injection identity before generic recovery."""
+    groups = {_FORM_GROUPS[form] for form in detect_dosage_form_in_input(input_name)}
+    liquid = _FORM_GROUPS['LIQUID'] in groups
+    injection = _FORM_GROUPS['INJECTION'] in groups
+    solvent = bool(re.search(r'\bSOLVENT\b', input_name, re.I))
+    if ((liquid or solvent) and groups and groups != {_FORM_GROUPS['LIQUID']}
+            or injection and groups != {_FORM_GROUPS['INJECTION']}):
+        return [], 'CONFLICTING_DOCEZAP_FORM'
+    # Form-missing MG doses already use the injection path; a missing injection
+    # family must not turn them into solvent requests.
+    dose = bool(re.search(r'(?<![\d.])\d+(?:\.\d+)?\s*MG(?![A-Z0-9])', input_name, re.I))
+    variant = 'SOLVENT' if liquid or solvent else 'PLAIN' if injection or not groups and dose else None
+    if variant is None:
+        return items, ''
+    selected = [item for item in items if str(item.get('variant', '')).upper() == variant]
+    selected = _form_compatible(selected, {'LIQUID'} if variant == 'SOLVENT' else {'INJECTION'})
+    return selected, '' if selected else 'MISSING_DOCEZAP_TARGET'
+
+
+def _select_docezap_strength(items: list, input_name: str, verbose=False, _lower_variant_retry=False):
+    """Reuse shared numeric ordering within the established presentation family."""
+    if not items:
+        return None
+    text = normalize_ocr_numeric_noise(input_name)
+    forms = detect_dosage_form_in_input(text)
+    solvent = {str(item.get('variant', '')).upper() for item in items} == {'SOLVENT'}
+    if solvent:
+        if (_lower_variant_retry
+                or not (forms or re.search(r'\bSOLVENT\b', text))
+                or any(_FORM_GROUPS.get(form) != _FORM_GROUPS['LIQUID'] for form in forms)
+                or '%' in text
+                or re.search(r'(?<![A-Z0-9])-\s*(?:\d|\.\d)', text)
+                or re.search(r'\d\s*(?:MG\s*)?(?:/|PER\b)\s*(?:\d+(?:\.\d+)?|\.\d+)?\s*(?:ML|L|MG|MCG|G|GM|KG|IU|UNIT)\b', text)
+                or re.search(r'\bMG\s*(?:/|PER\b)', text)
+                or re.search(r'\d\s*(?:MCG|GM|G|KG|IU|UNIT)\b', text)):
+            return None
+
+        def label_numbers(value):
+            positions = get_all_pack_positions(value)
+            positions += [match.span() for match in _PACK_MEASUREMENT.finditer(value)
+                          if match[2].upper() in {'ML', 'L'}]
+            for start, end in sorted(positions, reverse=True):
+                value = value[:start] + ' ' * (end - start) + value[end:]
+            return re.findall(r'(?<![A-Z0-9.])(\d+(?:\.\d+)?|\.\d+)(?![\d.])', value)
+
+        labels = label_numbers(text)
+        if len(labels) != 1 or not 0 < float(labels[0]) < float('inf'):
+            return None
+        vocabulary = (set(FORM_HINT_TOKENS) | set(DOSAGE_UNIT_SUFFIXES)
+                      | set(_DOSAGE_FORM_ALIASES) | _pack_form_skip_tokens())
+        numbered = []
+        for item in items:
+            strength = str(item.get('sub_variant', '')).strip()
+            product = str(item.get('product', '')).upper()
+            printed = label_numbers(product)
+            product_forms = detect_dosage_form_in_product(product)
+            if (not re.fullmatch(r'\d+(?:\.\d+)?', strength)
+                    or not 0 < float(strength) < float('inf')
+                    or len(printed) != 1 or float(printed[0]) != float(strength)
+                    or any(_FORM_GROUPS[form] != _FORM_GROUPS['LIQUID'] for form in product_forms)):
+                return []  # Do not rank past inconsistent solvent metadata.
+            # This is a partner-presentation label, not an invented solvent dose/pack.
+            numbered.append((item, (float(strength), 'PRESENTATION')))
+            vocabulary.update(re.findall(r'[A-Z]+', re.sub(r'(?<=\d)\s*X\s*(?=\d)', ' ', product)))
+        vocabulary_text = re.sub(r'(?<=\d)\s*X\s*(?=\d)', ' ', text)
+        if any(token not in vocabulary for token in re.findall(r'[A-Z]+', vocabulary_text)):
+            return None
+        selected, _ = select_pack_rows(numbered, [], (float(labels[0]), 'PRESENTATION'))
+        if verbose and selected:
+            print(f"  [DOCEZAP] exact / closest-lower / lowest solvent label: {labels[0]} -> {selected[0]['sub_variant']}")
+        return selected
+    doses = re.findall(r'(?<![\d.])(\d+(?:\.\d+)?)\s*MG(?![A-Z0-9])', text)
+    if (len(doses) != 1
+            or any(_FORM_GROUPS.get(form) != _FORM_GROUPS['INJECTION'] for form in forms)
+            or re.search(r'\bMG\s*(?:/|PER\b)', text)
+            or re.search(r'\d\s*(?:MCG|GM|G|KG|IU|UNIT)\b', text)):
+        return None
+    requested = measurement(doses[0], 'MG')
+    if requested is None:
+        return None
+    vocabulary = (set(FORM_HINT_TOKENS) | set(DOSAGE_UNIT_SUFFIXES)
+                  | set(_DOSAGE_FORM_ALIASES) | _pack_form_skip_tokens())
+    numbered = []
+    for item in items:
+        strength = str(item.get('sub_variant', '')).strip()
+        product = str(item.get('product', '')).upper()
+        product_forms = detect_dosage_form_in_product(product)
+        if (str(item.get('variant', '')).upper() != 'PLAIN'
+                or not re.fullmatch(r'\d+(?:\.\d+)?', strength)
+                or not product_forms
+                or any(_FORM_GROUPS.get(form) != _FORM_GROUPS['INJECTION'] for form in product_forms)):
+            return None
+        value = measurement(strength, 'MG')
+        printed = re.findall(r'(?<![\d.])(\d+(?:\.\d+)?)\s*MG\b', product)
+        if value is None or len(printed) != 1 or measurement(printed[0], 'MG') != value:
+            return None
+        numbered.append((item, value))
+        vocabulary.update(re.findall(r'[A-Z]+', product))
+    vocabulary_text = re.sub(r'(?<=\d)\s*X\s*(?=\d)', ' ', text)
+    if any(token not in vocabulary for token in re.findall(r'[A-Z]+', vocabulary_text)):
+        return None
+    selected, _ = select_pack_rows(numbered, [], requested)
+    if verbose and selected:
+        chosen = selected[0]['sub_variant']
+        print(f'  [DOCEZAP] exact / closest-lower / lowest strength: {doses[0]} MG -> {chosen} MG')
+    return selected
+
 def filter_items_prefer_exact_brand_token(items: list, brand: str, input_name: str, verbose=False) -> list:
     if len(items) <= 1 or not brand:
         return items
@@ -3024,6 +3134,12 @@ def process_product(input_name: str, brand_map: dict, all_variants: set=None, al
                and item['product_code'] == recovered.get('product_code')
                and item['product'] == recovered.get('output') for item in scoped_items):
             return recovered
+    # A brand hint or fuzzy recovery must not establish placebo identity. Check
+    # the original source so cleanup/retry cannot supply the required wording.
+    if result.get('product_code') and not re.search(r'\bPLACEBO\b', raw_input, re.I):
+        target_words = set(re.findall(r'[A-Z0-9]+', str(result.get('output', '')).upper()))
+        if {'PLACEBO', 'GLUTATHIONE'}.issubset(target_words):
+            return make_result('NO_CLEAR_MATCH', status='PLACEBO_WORD_REQUIRED', confidence='NONE')
     return result
 
 
@@ -3045,6 +3161,8 @@ def _process_product_core(input_name: str, brand_map: dict, all_variants: set=No
         return make_result(item['product'], item.get('product_code', ''), status='MATCHED', confidence='HIGH', candidate_count=1, suggestions=[{'product': item['product'], 'product_code': item.get('product_code', ''), 'score': 100.0}])
     if len(form_items) > 1:
         return make_result('NO_CLEAR_MATCH', '', status='AMBIGUOUS_FORM_NAME', confidence='NONE', candidate_count=len(form_items), suggestions=[{'product': item['product'], 'product_code': item.get('product_code', ''), 'score': 100.0} for item in form_items[:TOP_N_SUGGESTIONS]])
+    if 'ENZYME' in input_name.upper() and (not forced_brand or compact_brand_token(forced_brand) == 'HUENZYMEPROBIOTIC'):
+        input_name = normalize_hu_enzyme_source(input_name, brand_map)
     diof_source = None
     if 'DIOF' in input_name.upper() and (not forced_brand or compact_brand_token(forced_brand) == 'DIOF'):
         leading = re.match(r'[A-Z0-9]+', input_name.upper())
@@ -3111,6 +3229,10 @@ def _process_product_core(input_name: str, brand_map: dict, all_variants: set=No
         if verbose:
             print(f'\nNO_CLEAR_MATCH: no brand within {NO_BRAND_RECOVERY_MAX_EDITS} edits (nearest gap {dist})')
         return make_result('NO_CLEAR_MATCH', '', status='NO_BRAND', confidence='NONE', candidate_count=0, suggestions=suggestions)
+    if brand == 'DOCEZAP':
+        items, refusal = _prepare_docezap_candidates(input_name, items)
+        if refusal:
+            return make_result('NO_CLEAR_MATCH', status=refusal, confidence='NONE')
     maxtra_input = False
     diof_input = compact_brand_token(brand) == 'DIOF'
     if diof_input:
@@ -3281,6 +3403,14 @@ def _process_product_core(input_name: str, brand_map: dict, all_variants: set=No
             _retry = filter_items_by_sub_variant(_pool, detected_sub_variants, input_name, reference_items=_pool, verbose=verbose, _catalog_form_recovery=_catalog_form_recovery)
             if _retry:
                 items = _retry
+    # Establish numeric identity before a printed ML pack can discard the
+    # correct lower presentation. Physical pack selection still follows it.
+    docezap_selection = None
+    if brand == 'DOCEZAP':
+        docezap_selection = _select_docezap_strength(items, input_name, verbose=verbose,
+                                                    _lower_variant_retry=_lower_variant_retry)
+        if docezap_selection is not None:
+            items = docezap_selection
     _before_ns = items
     pack_input = _pack_selection_input(input_name, items) if compact_brand_token(brand) != 'PRODIOF' else input_name
     items = filter_items_by_name_strength(items, pack_input, verbose=verbose)
@@ -3290,6 +3420,25 @@ def _process_product_core(input_name: str, brand_map: dict, all_variants: set=No
             _retry = filter_items_by_name_strength(_pool, pack_input, verbose=verbose)
             if _retry:
                 items = _retry
+    ibatkin_tablet_default = (brand == 'IBATKIN' and not _input_forms and not _lower_variant_retry
+                             and detected_sub_variants - {'PLAIN'} == {'100'})
+    if ibatkin_tablet_default:
+        strength_text = normalize_ocr_numeric_noise(input_name)
+        pack_positions = get_all_pack_positions(strength_text)
+        ibatkin_tablet_default = any(
+            not is_position_in_pack_pattern(match.start(), match.end(), pack_positions)
+            for match in re.finditer(r'(?<![\d.])100(?:\.0+)?(?![\d.])', strength_text))
+        qualifier_text = strength_text
+        for start, end in sorted(pack_positions, reverse=True):
+            qualifier_text = qualifier_text[:start] + ' ' * (end - start) + qualifier_text[end:]
+        vocabulary = {'IBATKIN', 'PLAIN'} | set(DOSAGE_UNIT_SUFFIXES)
+        if any(token not in vocabulary for token in re.findall(r'[A-Z]+', qualifier_text)):
+            ibatkin_tablet_default = False
+    if ibatkin_tablet_default:
+        items = [item for item in items
+                 if str(item.get('variant', '')).upper() == 'PLAIN'
+                 and str(item.get('sub_variant', '')).strip() == '100'
+                 and detect_dosage_form_in_product(item['product']) == {'TABLET'}]
     legacy_pack = compact_brand_token(brand) == 'PRODIOF'
     requested_pack = None if legacy_pack else _input_pack_measurement(pack_input, items, _prefer_volume=brand in {'MAXTRA', 'SOVENTUS'})
     input_pack_size = extract_pack_size_from_input(input_name) if legacy_pack else str(requested_pack[0]) if requested_pack else ''
@@ -3321,6 +3470,16 @@ def _process_product_core(input_name: str, brand_map: dict, all_variants: set=No
                                       _measurement=requested_pack, _legacy=legacy_pack)
     if requested_pack and not items:
         return make_result('NO_CLEAR_MATCH', '', status='NO_COMPATIBLE_PACK', confidence='NONE', candidate_count=0)
+    if ibatkin_tablet_default:
+        valid = [item for item in items if str(item.get('product_code', '')).strip() not in {'', '0', '1', 'nan', 'None'}]
+        if len(items) != 1 or len(valid) != 1:
+            return make_result('NO_CLEAR_MATCH', status='AMBIGUOUS_IBATKIN_TABLET_TARGET' if len(items) > 1 else 'MISSING_IBATKIN_TABLET_TARGET',
+                               confidence='NONE', candidate_count=len(items), suggestions=build_item_suggestions(items, input_name))
+    if docezap_selection is not None:
+        valid = [item for item in items if str(item.get('product_code', '')).strip() not in {'', '0', '1', 'nan', 'None'}]
+        if len(items) != 1 or len(valid) != 1:
+            return make_result('NO_CLEAR_MATCH', status='AMBIGUOUS_DOCEZAP_TARGET' if len(items) > 1 else 'MISSING_DOCEZAP_TARGET',
+                               confidence='NONE', candidate_count=len(items), suggestions=build_item_suggestions(items, input_name))
     if maxtra_input:
         valid = [item for item in items if str(item.get('product_code', '')).strip() not in {'', '0', '1', 'nan', 'None'}]
         if len(items) != 1 or len(valid) != 1:
